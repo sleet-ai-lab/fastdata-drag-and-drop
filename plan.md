@@ -101,50 +101,56 @@ FastFS indexer is what turns the transaction into a served file.
 
 ### the one trap
 
-`outcomes.status` comes back **`false`** even on uploads that
-worked. we verified this on the `mob.near` transaction that produced
-the live png — same `status: false`, working file.
+`outcomes.status` comes back **`false`** on *every* fastfs upload —
+the ones that worked and the ones that did not. we verified this on
+the `mob.near` transaction that produced the live png: same
+`status: false`, working file.
 
 a function call to an account with no contract has no successful
 "method return" to report, so the receipt reads as unsuccessful even
 though the transaction was included and the file was indexed.
 
-**we must not treat `status: false` as an upload error.** the only
-trustworthy success signal is **fetching the file url back and
-checking the bytes match**. that is how the ui decides success.
+**we must not treat `status: false` as an upload error — and we must
+not treat it as success either.** the receipt status tells us
+nothing. the only trustworthy success signal is **fetching the file
+url back and checking the bytes match**. that is how the ui decides
+success.
+
+(there is a *second* trap here, and it is the important one: the
+args encoding. a transaction can have the same `status: false`, the
+same gas and the same everything, and still not land, purely because
+the args were sent as a string. see section 3b.)
 
 ### decision needed
 
 which receiver id do we use?
 
-| option | url | notes |
+**decided: `fastfs.near` on mainnet, `fastfs.testnet` on testnet.**
+both accounts exist on their networks (we verified both on chain), and
+both work as namespaces. we follow the near convention of
+`<name>.testnet` for the testnet one, same as the reference's
+commented-out `ConstantsTestnet`.
+
+| network | receiver id | url |
 | --- | --- | --- |
-| the uploader's own account | `https://{me}.fastfs.io/{me}/{path}` | no setup at all, but the url carries the account twice |
-| a dedicated app account | `https://{app}.fastfs.io/{app}/{path}` | cleaner urls, needs one account created and its key kept |
-| `fastfs.near` (the reference) | `https://{me}.fastfs.io/fastfs.near/{path}` | the reference's choice. it works as a namespace, but it is not a contract and we do not control it |
+| mainnet | `fastfs.near` | `https://{me}.fastfs.io/fastfs.near/{path}` |
+| testnet | `fastfs.testnet` | `https://{me}.fastfs.io/fastfs.testnet/{path}` |
 
-the reference uses `fastfs.near`. **we default to that for parity**, but
-it is worth a second look — the account exists on mainnet (we verified
-it), so a function call to it is a valid no-op call that the indexer
-still picks up. the one risk is that the account could be deleted or
-renamed.
-
-> **open question for the user:** do we keep `fastfs.near` as the
-> namespace, or use our own account? everything else in this plan is
-> unaffected.
+the receiver id is resolved from the current network, so the network
+toggle moves both the chain we talk to and the namespace in the url.
 
 ### the method name and args
 
 | | |
 | --- | --- |
 | method | `__fastdata_fastfs` |
-| args | the borsh-encoded `FastfsData` enum, as raw bytes |
+| args | the borsh-encoded `FastfsData` enum, as **raw bytes** |
 | receiver | the namespace account (see above) |
 | deposit | `0` |
 
 ### the borsh schema
 
-the spec's schema is the **simple** variant only:
+**decided: the `simple` variant only.** no chunking.
 
 ```
 FastfsData = enum {
@@ -156,14 +162,20 @@ FastfsData = enum {
 ```
 
 the reference also has a `partial` variant with `offset` / `fullSize` /
-`contentChunk` / `nonce`, used for files over 1 MiB. the spec does not
+`contentChunk` / `nonce`, for files over 1 MiB. the spec does not
 document `partial` — it says "File Size: Be mindful of NEAR transaction
 size limits" and points at separate transactions per file instead.
 
-> **open question for the user:** do we support the `partial` chunked
-> path from the reference, or only the documented `simple` one? `simple`
-> is what the spec guarantees. `partial` is what the reference actually
-> ships, so it presumably works, but it is undocumented.
+we skip `partial`. one transaction per file, one `simple` entry. the
+consequence is that a big file is one transaction carrying the whole
+file, so NEAR's transaction size limit applies — we cap the file size
+in the ui and say so, rather than chunking.
+
+we keep the `partial` variant in the schema (`src/fastfs/schema.js`)
+so the enum discriminant ordering stays identical to the working
+transaction. `partial` is variant 1, `simple` is variant 0, and the
+working upload's args start with `0x00` — so `simple` must stay
+first in the enum.
 
 ### validation rules (from the spec)
 
@@ -326,41 +338,110 @@ survive.
 ### hop 4 — what actually lands on chain
 
 the wallet signs the transaction and base64-encodes the args for the
-wire. we verified against a real mainnet transaction:
+wire. **this is where the two shapes diverge, and only one of them
+works.**
 
-the `sleet.near` -> `fastfs.near` upload with path `notes/small.txt`
-and content `hello fastfs\n` has these on-chain args:
+we compared two real mainnet transactions. this is the whole game:
+
+| tx | signer -> receiver | on-chain args | file served? |
+| --- | --- | --- | --- |
+| `5vUqtNhY...` | `mob.near` -> `fastfs.near` | **121512 raw borsh bytes** | **yes** — 200, a real 121477-byte png |
+| `DoiiVsPGG...` | `sleet.near` -> `fastfs.near` | **74 bytes** = the borsh bytes as a *quoted base64 string* | **no** — 404 |
+
+the working one's args, read off the chain, start:
 
 ```
-AA8AAABub3Rlcy9zbWFsbC50eHQBCgAAAHRleHQvcGxhaW4NAAAAaGVsbG8gZmFzdGZzCg==
+00 0c000000 "fastnear.png" 01 09000000 "image/png" 85da0100 <121477 png bytes>
 ```
 
-decoded, that is **52 bytes**, and it is exactly the borsh encoding of:
+- `00` — enum discriminant, `simple`
+- `0c 000000` — string length 12
+- `01` — option is `Some`
+- `09 000000` — string length 9
+- `85da0100` — u8 array length 121477 = exactly the png's size
+
+the failing one's args, decoded, are literally this text:
 
 ```
-simple: {
-  relativePath: "notes/small.txt",
-  content: { mimeType: "text/plain", content: "hello fastfs\n" }
+"AA8AAABub3Rlcy9zbWFsbC50eHQBCgAAAHRleHQvcGxhaW4NAAAAaGVsbG8gZmFzdGZzCg=="
+```
+
+that is the **borsh bytes wrapped in a JSON string**. the base64 of
+the correct 52-byte payload, but as a *string* instead of as bytes.
+the indexer cannot read it, so the upload silently does not land and
+the url 404s.
+
+**this is the single most important thing to get right.** the
+difference between a working upload and a silent failure is only
+whether the args arrive as raw bytes or as a string.
+
+### why the failing one happened
+
+near-api-js's `stringifyJsonOrBytes`:
+
+```js
+function stringifyJsonOrBytes(args) {
+  const isUint8Array = args.byteLength !== undefined && args.byteLength === args.length;
+  return isUint8Array ? args : Buffer.from(JSON.stringify(args));
 }
 ```
+
+pass a `Uint8Array` and it is left alone. pass a **base64 string** and
+it becomes `Buffer.from(JSON.stringify("AA8A..."))` — a JSON string,
+74 bytes. that is exactly the failed transaction.
+
+so the rule is absolute:
+
+> **the args must be raw `Uint8Array` bytes. never a base64 string,
+> never JSON, never a string of any kind.**
+
+the spec's own example makes the same point — it base64s the bytes
+with `near.utils.bytesToBase64(serializedData)` because **that
+example calls `near.functionCall` directly**, where the args are a
+JSON field and must be base64. the reference app copies that base64
+into a *different* API (`callFunction`), where it gets double-encoded
+and the upload breaks.
 
 ### the verification we ran
 
 we reproduced the whole path locally with the real `borsh` package and
-the real schema from the reference, and compared against the on-chain
-bytes:
+the real schema, and compared against the working transaction's layout:
+
+```
+our payload:  00 0f000000 "notes/small.txt" 01 0a000000 "text/plain" <content>
+working tx:   00 0c000000 "fastnear.png"    01 09000000 "image/png"    <png>
+              ^^                                          ^^
+              same layout, same field order, same encodings
+```
+
+and through the four hops:
 
 ```
 STEP 1 near-kit functionCall args is Uint8Array: true len: 52
 STEP 2 JSON.parse failed -> passes through as raw bytes. type: Uint8Array len: 52
 STEP 3 raw bytes preserved. type: Uint8Array len: 52
 STEP 4 wire base64: AA8AAABub3Rlcy9zbWFsbC50eHQBCgAAAHRleHQvcGxhaW4NAAAAaGVsbG8gZmFzdGZzCg==
-expected on-chain: AA8AAABub3Rlcy9zbWFsbC50eHQBCgAAAHRleHQvcGxhaW4NAAAAaGVsbG8gZmFzdGZzCg==
 MATCH: true
 ```
 
-**all 52 bytes survive all four hops unchanged.** this is the proof
-that the encoding we build is the encoding the chain expects.
+`verify/encoding.test.ts` pins this. it builds a payload with the
+working transaction's exact shape and asserts it matches the expected
+byte-for-byte, and it asserts we are **not** producing the failed
+transaction's shape.
+
+### the two shapes, side by side
+
+```
+WORKS (raw bytes, 121512 for the png):
+  00 0c000000 "fastnear.png" 01 09000000 "image/png" 85da0100 <png bytes>
+
+FAILS (base64 string, json-wrapped, 74 bytes):
+  22 41 41 38 41 41 41 42 ... 22   <- 0x22 is the opening quote
+  ^-- "AA8AAABub3Rlcy9zbWFsbC50eHQB..."
+```
+
+if the first byte of your args is `0x22` (`"`), you have sent a string
+and the upload will not land.
 
 ### what the wallet actually receives
 
@@ -612,13 +693,17 @@ looks like a bug. it is not.
 we pulled real `__fastdata_fastfs` transactions off mainnet through
 the nearblocks api:
 
-| tx | signer -> receiver | gas attached | gas used | file resolves? |
-| --- | --- | --- | --- | --- |
-| `5vUqtNhYchWyrifviVZ9F6k4QprgfW9fjSAtcGMdQyRw` | `mob.near` -> `fastfs.near` | **1** | 7,485,986,585,821 | **yes** — 200, a real 121 KB png |
-| `DoiiVsPGGteDcRgjhJBLBYnwLfcwEX3wd6DQ2hHodhyJ` | `sleet.near` -> `fastfs.near` | **1** | 1,423,844,250,559 | no (404) |
-| `3e3KZu8Jqpj42wUehjHPMeizaLzQeDVGf7cyGyLYhfwe` | `nonresistant.near` -> `fastfs.near` | **1** | 1,441,415,967,007 | no (404) |
+| tx | signer -> receiver | gas attached | gas used | args shape | file resolves? |
+| --- | --- | --- | --- | --- | --- |
+| `5vUqtNhYchWyrifviVZ9F6k4QprgfW9fjSAtcGMdQyRw` | `mob.near` -> `fastfs.near` | **1** | 7,485,986,585,821 | raw borsh, 121512 B | **yes** — 200, a real 121 KB png |
+| `DoiiVsPGGteDcRgjhJBLBYnwLfcwEX3wd6DQ2hHodhyJ` | `sleet.near` -> `fastfs.near` | **1** | 1,423,844,250,559 | base64 string, 74 B | no (404) |
+| `3e3KZu8Jqpj42wUehjHPMeizaLzQeDVGf7cyGyLYhfwe` | `nonresistant.near` -> `fastfs.near` | **1** | 1,441,415,967,007 | — | no (404) |
 
 the **working** upload used `gas_attached: 1`.
+
+note that the two failed ones also attached `1` — and one of them is
+the *same* `fastfs.near` receiver. **the gas was never the problem.**
+those two failed on the args encoding (section 3b), not on gas.
 
 ### why `1` is enough
 
@@ -644,15 +729,18 @@ contract that has to execute something.
 ### two things worth noting
 
 1. **`gas_used` scales with the file size**, not with the attached gas.
-   the small `notes/small.txt` used 1.42 TGas, the 121 KB png used
-   7.49 TGas. that is the receipt-conversion + storage cost of the
-   payload. it is charged regardless.
+   the small payload used 1.42 TGas, the 121 KB png used 7.49 TGas.
+   that is the receipt-conversion + storage cost of the payload. it is
+   charged regardless.
 
 2. **`outcomes.status` is `false` on working uploads too.** the
    `mob.near` tx that produced a live, served png also shows
    `status: false`. so a `false` status is **not** a failed upload —
    it is what a function call to a contractless account looks like. we
    must not treat it as an error in the ui.
+
+   **and it is also `false` on the failed uploads.** so the status
+   tells us nothing either way. the file url is the only signal.
 
 ### what we do
 
@@ -715,12 +803,13 @@ guarantees the bytes we build are the bytes that land on chain.
       wallet, with the per-connector listener set. no upload yet.
 - [ ] **2. port the fastfs encoding, with a regression check.** create
       `src/fastfs/schema.js` with the borsh schema. then pin the
-      encoding with a test that asserts our bytes equal the on-chain
-      bytes for `notes/small.txt` — the exact 52 bytes we verified
-      against `sleet.near` -> `fastfs.near`:
-      `AA8AAABub3Rlcy9zbWFsbC50eHQBCgAAAHRleHQvcGxhaW4NAAAAaGVsbG8gZmFzdGZzCg==`.
-      also assert the payload is **not** valid JSON, because the whole
-      chain depends on the `JSON.parse` branch failing (section 3b).
+      encoding with a test that builds a payload with the **working**
+      transaction's exact shape (`fastnear.png` / `image/png` /
+      121477 bytes) and asserts it matches the on-chain bytes byte for
+      byte. also assert the payload is **not** valid JSON (the chain
+      depends on that `JSON.parse` branch failing) and that it starts
+      with `0x00`, not with a `"` quote — the failed upload started
+      with a quote and 404s. section 3b.
 - [ ] **3. port the upload.** create `src/fastfs/upload.js`. call
       `near.call(receiver, "__fastdata_fastfs", bytes, { gas: "1" })`
       with `bytes` a `Uint8Array` — never a base64 string.
@@ -744,18 +833,33 @@ guarantees the bytes we build are the bytes that land on chain.
 
 ---
 
-## 9. open questions
+## 9. decisions and remaining questions
 
-1. **which receiver / namespace id?** `fastfs.near` (the reference) or
-   our own account. affects the url. `fastfs.near` is proven to work
-   as a namespace; using our own account is cleaner but untested.
+### decided
+
+1. **receiver / namespace** — `fastfs.near` on mainnet,
+   `fastfs.testnet` on testnet. both verified to exist on chain.
    section 2.
-2. **`simple` only, or also `partial` chunking?** the spec documents
-   only `simple`. the reference ships `partial` for files over 1 MiB.
-   section 2.
-3. **do we support files over 1 MiB at all** — if `simple` only, a
-   large file is one transaction with the whole file in it, and NEAR's
-   transaction size limit applies.
+2. **schema** — `simple` only, no chunking. section 2.
+3. **gas** — `"1"`, matching the reference and the working
+   transaction. section 6.
+4. **network toggle** — no page reload; per-connector listener set.
+   section 4.
+
+### still open
+
+1. **the max file size.** with `simple` only, the whole file goes in
+   one transaction, so NEAR's transaction size limit applies. the
+   reference caps the drop zone at 32 MB. we need to pick a cap and
+   show it in the ui. (the working png was 121 KB — small files are
+   proven, large ones are not.)
+2. **the mime type for files the browser gives no type for.** the spec
+   requires a non-empty `mimeType` and rejects the transaction
+   otherwise. we need a fallback for extensionless or unknown-type
+   files.
+3. **the relative path.** the reference has a user-editable relative
+   path field, defaulting to `/`. we should keep that — the path is
+   part of the served url.
 
 ---
 
@@ -772,13 +876,22 @@ guarantees the bytes we build are the bytes that land on chain.
 - **pulling the tx back from the chain and base64-decoding its args
   gives byte-for-byte the same bytes we built.** this is the direct
   check that what we encoded is what landed
+- **the decoded args start with `0x00`, not with `0x22` (`"`).** if
+  they start with a quote, we sent a string and the upload will 404
 - the file is served at
   `https://{account}.fastfs.io/{namespace}/{path}` and the served
   bytes match what we uploaded
-- a `status: false` receipt is **not** treated as a failure — the
-  success signal is the served file
+- a `status: false` receipt is **not** treated as a failure, and not
+  treated as success either — it tells us nothing. the success signal
+  is the served file
 - if the tx args or the served bytes do not match, the ui reports the
   upload as failed. it does not show a success link
+
+**the failure mode to avoid** is the one we found on chain: a
+transaction with the right method, the right gas, the right receiver
+and a `status: false` receipt, whose file 404s because the args were
+sent as a base64 string instead of raw bytes. that failure is silent
+— nothing errors, the tx succeeds, the file just never appears.
 
 ### the app around it
 
