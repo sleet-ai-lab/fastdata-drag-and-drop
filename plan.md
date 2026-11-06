@@ -17,6 +17,15 @@ we are building the same app as the reference —
   `../fastdata-drag-and-drop-reference`
 - the format spec: <https://hackmd.io/@fastnear/fastfs-docs>
 
+we also read the open-source pieces that actually implement FastFS,
+because they are the real contract our app has to satisfy — the
+prose spec is thinner than the code:
+
+| repo | what it is | what we read it for |
+| --- | --- | --- |
+| `fastnear/fastdata-indexer` | watches the chain, decodes the args, stores them | the schema, the validation rules, **and the proof that the args must be raw bytes** |
+| `fastnear/fastfs-server` | serves the files over http | what it takes for a file to actually be served |
+
 the reference is `fastfs-upload-demo`. it:
 
 1. lets you drop files on a zone (via `react-files`)
@@ -33,7 +42,9 @@ the reference is `fastfs-upload-demo`. it:
 | the file URL shape | `src/Upload/Upload.jsx` | `https://{account}.fastfs.io/...` |
 | the ui shape | `src/Upload/Upload.jsx` | drop zone, relative path, file list, progress |
 | the size caps | `src/Upload/Upload.jsx` | 32 MB drop zone, 10 files per drop |
+| the editable relative path | `src/Upload/Upload.jsx` | keep it — the path is part of the served url |
 | the chunking rules | `src/Upload/Upload.jsx` | **not** — we use `simple` only (section 2) |
+| the mime type handling | `src/Upload/Upload.jsx` | **not** — it passes `file.type` through with no fallback, so an unclassifiable file fails on chain (section 2) |
 
 ### what we change
 
@@ -149,6 +160,62 @@ toggle moves both the chain we talk to and the namespace in the url.
 | receiver | the namespace account (see above) |
 | deposit | `0` |
 
+### how we know the args must be raw bytes
+
+the indexer is open source (`fastnear/fastdata-indexer`). we read how
+it actually consumes the transaction, and it settles the question
+completely.
+
+**1. the indexer picks up any method with the `__fastdata_` prefix**
+(`main-indexer/src/main.rs:12`):
+
+```rust
+const FASTDATA_PREFIX: &str = "__fastdata_";
+```
+
+**2. it takes the action's args as raw bytes, untouched**
+(`main-indexer/src/main.rs:133-143`):
+
+```rust
+if let ActionView::FunctionCall { method_name, args, .. } = action {
+    if method_name.starts_with(FASTDATA_PREFIX) {
+        data.push(FastData {
+            ...
+            data: args.to_vec(),   // <- the raw bytes, verbatim
+            ...
+        });
+    }
+}
+```
+
+**3. it borsh-decodes them straight into the schema**
+(`fastfs-sub-indexer/src/main.rs:97`):
+
+```rust
+if let Ok(value) = borsh::from_slice(&fastdata.data) {
+    match value {
+        FastfsData::Simple(simple_fastfs) => { ... }
+        FastfsData::Partial(partial_fs) => { ... }
+    }
+}
+```
+
+`borsh::from_slice` on a JSON-wrapped base64 string **fails**, so the
+`if let Ok(value)` is false and the action is **dropped without a
+trace**. the transaction still succeeds, the file never appears, and
+the url 404s.
+
+**this is the exact mechanism behind the failed `sleet.near`
+transaction.** it is not a gas problem, not a receiver problem and not
+a status problem. the args were a string, `borsh::from_slice` failed,
+and the indexer threw the action away.
+
+so the rule is now backed by the consumer's own code, not just by
+observation:
+
+> **the args must be the raw borsh bytes. a JSON-wrapped base64
+> string is silently discarded by the indexer.**
+
 ### the borsh schema
 
 **decided: the `simple` variant only.** no chunking.
@@ -200,6 +267,81 @@ incomplete, so the server has nothing complete to serve.
 **this tells us the `partial` format is real and the indexer reads
 it.** we are still skipping it, because it doubles the code and the
 nonce/offset bookkeeping for a case we do not need.
+
+### the mime type — read from the indexer, not guessed
+
+the reference passes `file.type` straight through with **no fallback**:
+
+```js
+mimeType: file.type,   // src/Upload/Upload.jsx:37 and :60
+```
+
+the browser leaves `file.type` as `""` for a file it cannot classify.
+the spec says a non-empty mime type is required. so the reference has
+a hole: an unclassifiable file produces an empty mime type, and the
+transaction is rejected.
+
+we read the indexer's own validation code
+(`fastnear/fastdata-indexer`, `fastfs-sub-indexer/src/fastfs.rs`) to
+settle what the rules actually are:
+
+```rust
+const MAX_RELATIVE_PATH_LENGTH: usize = 1024;
+const MAX_MIME_TYPE_LENGTH: usize = 256;
+
+impl SimpleFastfs {
+    pub fn is_valid(&self) -> bool {
+        if self.relative_path.len() > MAX_RELATIVE_PATH_LENGTH { return false; }
+        if let Some(content) = &self.content {
+            if content.mime_type.is_empty() || content.mime_type.len() > MAX_MIME_TYPE_LENGTH {
+                return false;
+            }
+        }
+        true
+    }
+}
+```
+
+so for a `simple` upload:
+
+| field | rule |
+| --- | --- |
+| `relativePath` | max **1024** bytes |
+| `mimeType` | must be **non-empty**, max **256** bytes |
+| `content` | optional — `None` means **delete** the file |
+
+and the server side (`fastnear/fastfs-server`, `src/main.rs`):
+
+```rust
+if first.offset == 0 {
+    if let (Some(mime_type), Some(content)) = (first.mime_type, first.content) {
+        // serve it
+    }
+}
+HttpResponse::NotFound().finish()
+```
+
+**a `None` mime type or a `None` content means the url 404s.** the
+indexer stores `mime_type: None` when the borsh `content` is `None`,
+so a delete-by-upload produces a 404, which is the intended outcome.
+
+### our mime type rule
+
+**we only accept files whose mime type the browser recognises.** that
+is the user's instruction, and it lines up exactly with what the
+protocol requires — no fallback needed, no guessing.
+
+- a file with an empty `file.type` is **rejected in the ui** with a
+  clear message, before we ever build a transaction
+- we show the detected mime type on the staged file, so the user can
+  see what will be sent
+- we do **not** guess from the extension. a wrong guess produces a
+  wrong `Content-Type` on the served file, which is worse than a
+  clear rejection
+
+this also closes the reference's hole: it lets the user pick a file it
+cannot classify, the transaction gets rejected on chain, and the app
+shows nothing useful about why.
 
 ### the size limit, from the protocol
 
@@ -253,12 +395,17 @@ nonce, the last-chunk detection) for a case we do not need, and the
 ever want big files, this is the design to follow, and the schema is
 already in place for it.
 
-### validation rules (from the spec)
+### validation rules
 
-- `relativePath` max 1024 characters
-- `mimeType` required, cannot be empty
-- `content` may be `null` — that **deletes** the file
-- a path over 1024 chars or an empty mime type fails the transaction
+from the indexer's own code, not the prose spec:
+
+- `relativePath` max **1024** bytes
+- `mimeType` must be **non-empty**, max **256** bytes
+- `content` may be `None` — that **deletes** the file (and the url
+  then 404s, which is correct)
+- a path over 1024 bytes or an empty mime type means the indexer
+  **drops the action silently** — the transaction still succeeds, the
+  file just never appears
 
 ### the file url
 
@@ -849,6 +996,7 @@ src/
     network.js            toggle + the network state
   fastfs/
     schema.js             the borsh schema            (done)
+    validate.js           the per-file checks, before we build a tx
     upload.js             file -> borsh -> near.call, with progress
   components/
     Header.jsx            account button + network toggle
@@ -857,6 +1005,8 @@ src/
 verify/
   encoding.test.ts        pins the borsh bytes against the on-chain
                           transaction (done)
+  validate.test.ts        pins the rejection rules against the
+                          indexer's own limits
 ```
 
 the reference uses `src/hooks/` and `src/Upload/`; ours uses
@@ -898,12 +1048,17 @@ guarantees the bytes we build are the bytes that land on chain.
       receipt is expected and must not be read as a failure. this is
       section 6.
 - [ ] **6. build the ui.** replace the boilerplate with the header
-      (account + network toggle), the drop zone, the file list and
-      the upload progress.
-- [ ] **7. wire it together.** the header's connect button gates the
+      (account + network toggle), the drop zone, the editable relative
+      path, the file list and the upload progress.
+- [ ] **7. the validation layer.** one module that checks every file
+      before we build a transaction: size over 1 MB, empty mime type,
+      relative path over 1024 bytes, more than 10 files. each
+      rejection names the limit that was hit. this is what keeps a
+      bad file from becoming a silent on-chain failure.
+- [ ] **8. wire it together.** the header's connect button gates the
       upload area, like the reference does. the ui shows which network
       the connected account is on.
-- [ ] **8. containerize + deploy.** the docker setup already exists
+- [ ] **9. containerize + deploy.** the docker setup already exists
       in `DOCKER/`. rebuild the image, redeploy through the cloudflare
       tunnel, confirm the route.
 
@@ -925,16 +1080,37 @@ guarantees the bytes we build are the bytes that land on chain.
    1 MiB. the `partial` chunking path exists and works on chain, but
    we skip it. per-file cap 1 MB, outer drop-zone cap 32 MB, max 10
    files per drop. section 2.
+6. **mime type** — only accept files the browser can classify. a file
+   with an empty `file.type` is rejected in the ui with a clear
+   message. no extension-based guessing. section 2.
+7. **relative path** — editable, like the reference. the path is part
+   of the served url, so it is worth letting the user set it.
 
 ### still open
 
-1. **the mime type for files the browser gives no type for.** the spec
-   requires a non-empty `mimeType` and rejects the transaction
-   otherwise. we need a fallback for extensionless or unknown-type
-   files.
-2. **the relative path.** the reference has a user-editable relative
-   path field, defaulting to `/`. we should keep that — the path is
-   part of the served url.
+nothing blocking. the remaining choices are cosmetic:
+
+1. **the exact wording** of the ui messages for each rejection
+   (too big, no mime type, too many files, path too long).
+2. **the default relative path** — the reference uses `/` and strips
+   the leading slash. we should match that.
+3. **whether to show the mime type on the staged file.** the reference
+   does (`<code>{file.type}</code>`), and it helps the user spot a
+   misclassified file before uploading.
+
+### verified against the real consumers
+
+we read the open-source indexer and server rather than trusting the
+prose spec:
+
+- `fastnear/fastdata-indexer` — `main-indexer/src/main.rs` (how the
+  action is picked up and the args are read) and
+  `fastfs-sub-indexer/src/fastfs.rs` (the schema and the validation
+  rules)
+- `fastnear/fastfs-server` — `src/main.rs` (what it takes to serve a
+  file)
+
+these give us the exact contract our app has to satisfy. section 2.
 
 ---
 
@@ -975,8 +1151,10 @@ sent as a base64 string instead of raw bytes. that failure is silent
 - the network toggle switches mainnet/testnet **without a page reload**,
   and the wallet listeners follow the connector
 - the ui shows the network of the connected account
-- dropping a file shows it staged with its size and type
+- dropping a file shows it staged with its size and mime type
 - a file over 1 MB is rejected with a clear message naming the limit
+- a file the browser cannot classify is rejected with a clear message
+- a relative path over 1024 bytes is rejected with a clear message
 - more than 10 files in one drop is rejected the same way
 - a failed upload shows the error instead of silently failing
 
