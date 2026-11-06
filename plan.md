@@ -1040,15 +1040,15 @@ contract that has to execute something.
 
 ```
 src/
-  app.jsx                 the shell — keep the vite boilerplate for now,
-                          swap in the app once the plan is agreed
+  app.jsx                 the shell
   main.jsx                preact entry — unchanged
-  index.css / app.css    the vite boilerplate styles — keep
+  index.css               the tokens (light + dark) — unchanged
+  app.css                 the app's styles
   near/
     wallet.js             connector + per-connector listeners + sign in/out
-    network.js            toggle + the network state
+    network.js            toggle + the network state + the receiver id
   fastfs/
-    schema.js             the borsh schema            (done)
+    schema.js             the borsh schema
     validate.js           the per-file checks, before we build a tx
     upload.js             file -> borsh -> near.call, with progress
   components/
@@ -1057,9 +1057,11 @@ src/
     FileList.jsx          the staged files + the uploaded results
 verify/
   encoding.test.ts        pins the borsh bytes against the on-chain
-                          transaction (done)
+                          transaction
   validate.test.ts        pins the rejection rules against the
                           indexer's own limits
+  upload.test.ts          pins the encoding shape, the quote check and
+                          the verification failure path
 ```
 
 the reference uses `src/hooks/` and `src/Upload/`; ours uses
@@ -1076,11 +1078,11 @@ guarantees the bytes we build are the bytes that land on chain.
 
 ## 8. steps
 
-- [ ] **1. wire the near tools.** add `@near-kit-tool-box/web` and
+- [x] **1. wire the near tools.** add `@near-kit-tool-box/web` and
       `borsh`. create `src/near/wallet.js` and `src/near/network.js`.
       the network toggle and the connect button work against a real
-      wallet, with the per-connector listener set. no upload yet.
-- [ ] **2. port the fastfs encoding, with a regression check.** create
+      wallet, with the per-connector listener set.
+- [x] **2. port the fastfs encoding, with a regression check.** create
       `src/fastfs/schema.js` with the borsh schema. then pin the
       encoding with a test that builds a payload with the **working**
       transaction's exact shape (`fastnear.png` / `image/png` /
@@ -1089,31 +1091,47 @@ guarantees the bytes we build are the bytes that land on chain.
       depends on that `JSON.parse` branch failing) and that it starts
       with `0x00`, not with a `"` quote — the failed upload started
       with a quote and 404s. section 3b.
-- [ ] **3. port the upload.** create `src/fastfs/upload.js`. call
+- [x] **3. port the upload.** create `src/fastfs/upload.js`. call
       `near.call(receiver, "__fastdata_fastfs", bytes, { gas: "1" })`
       with `bytes` a `Uint8Array` — never a base64 string.
-- [ ] **4. verify the transaction on chain.** after one real upload,
-      fetch the tx back and **base64-decode its args**, then compare
-      them byte-for-byte to our local bytes. that is the direct check
-      that the bytes we built are the bytes that landed. section 3b.
-- [ ] **5. verify the served file.** fetch the file url back and
-      compare the bytes to what we uploaded. `status: false` on the
-      receipt is expected and must not be read as a failure. this is
-      section 6.
-- [ ] **6. build the ui.** replace the boilerplate with the header
-      (account + network toggle), the drop zone, the editable relative
-      path, the file list and the upload progress.
-- [ ] **7. the validation layer.** one module that checks every file
-      before we build a transaction: size over 1 MB, empty mime type,
-      relative path over 1024 bytes, more than 10 files. each
-      rejection names the limit that was hit. this is what keeps a
-      bad file from becoming a silent on-chain failure.
-- [ ] **8. wire it together.** the header's connect button gates the
+- [x] **4. the validation layer.** `src/fastfs/validate.js`. size over
+      1 MB, empty mime type, relative path over 1024 bytes, more than
+      10 files. each rejection names the limit that was hit. this is
+      what keeps a bad file from becoming a silent on-chain failure.
+- [x] **5. build the ui.** the header (account + network toggle), the
+      drop zone, the editable relative path, the file list and the
+      results.
+- [x] **6. wire it together.** the header's connect button gates the
       upload area, like the reference does. the ui shows which network
       the connected account is on.
-- [ ] **9. containerize + deploy.** the docker setup already exists
-      in `DOCKER/`. rebuild the image, redeploy through the cloudflare
-      tunnel, confirm the route.
+- [x] **7. containerize + deploy.** the docker setup already exists
+      in `DOCKER/`. the image is rebuilt and the site is live at
+      https://fastdata-drag-and-drop.shit-1170.com/.
+- [ ] **8. the real upload.** the one thing we cannot do from here: a
+      human connects a wallet and uploads a file. the app verifies the
+      on-chain args by itself; the human opens the url and confirms the
+      file is served.
+- [ ] **9. testnet first, then mainnet.** switch the network to
+      testnet, upload, and let the app's args check confirm the
+      encoding. then switch to mainnet and open the url. section 3b.
+
+### where the code is now
+
+| file | what it does |
+| --- | --- |
+| `src/near/wallet.js` | the wallet connection, per-connector listeners |
+| `src/near/network.js` | the network toggle, the receiver id, the rpc url |
+| `src/fastfs/schema.js` | the borsh schema |
+| `src/fastfs/validate.js` | the pre-flight checks |
+| `src/fastfs/upload.js` | encode → send → verify |
+| `src/components/Header.jsx` | the account button and the network toggle |
+| `src/components/DropZone.jsx` | the native drag-and-drop, the drop validation |
+| `src/components/FileList.jsx` | the staged files and the results |
+| `src/app.jsx` | the shell |
+| `src/app.css` | the styles |
+
+`bun run test` runs the 54 tests. they must stay green — they are what
+guarantees the bytes we build are the bytes that land on chain.
 
 ---
 
