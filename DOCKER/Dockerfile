@@ -1,8 +1,8 @@
 # ========================================
 # fastdata-drag-and-drop — Dockerfile
 #
-# three stages:
-#   builder — node:24-alpine, runs `vite build` over src/ into dist/
+# two stages:
+#   builder — oven/bun:1-alpine, runs `vite build` over src/ into dist/
 #   runtime — nginx:alpine, serves the built dist/ as static files
 #
 # the runtime stage carries ONLY the built site + nginx config. no bun,
@@ -16,38 +16,45 @@
 # ========================================
 # Stage 1: build the static site.
 #
-# WHY node and not bun: the vite build under `oven/bun:alpine` needs a
-# real node runtime for the rollup native bindings to resolve on
-# alpine (musl). node:24-alpine carries the matching musl build, so
-# `vite build` succeeds without extra apk packages.
+# WHY bun and not node: bun owns the lockfile in this repo (bun.lock,
+# tracked), so `bun install --frozen-lockfile` installs exactly the
+# committed dependency tree. npm would have to re-resolve every
+# version from the registry, because there is no package-lock.json.
 #
-# node only lives in this stage — the final image is nginx:alpine.
+# the vite build runs fine under bun on alpine — vite 8's rollup
+# native binding resolves on musl without extra apk packages.
+#
+# bun only lives in this stage — the final image is nginx:alpine.
 # ========================================
-FROM node:24-alpine AS builder
+FROM oven/bun:1-alpine AS builder
 
 WORKDIR /build
 
 # copy the manifest + lockfile FIRST so the dependency install layer is
 # cached independently of source-only edits.
 #
-# NOTE: the lockfile is gitignored in this repo (see .gitignore), so it
-# is usually absent from the build context. `npm install` (not
-# `npm ci`) is used because there is nothing to install *from* —
-# a lockfile is what `npm ci` requires.
-COPY package.json ./
+# the lockfile IS tracked (see .gitignore), so it is copied here and the
+# install is fully reproducible: `bun install --frozen-lockfile` fails
+# the build if package.json and bun.lock ever disagree, instead of
+# silently resolving a different tree.
+COPY package.json bun.lock ./
 COPY src ./src
 COPY index.html ./index.html
 COPY vite.config.js ./vite.config.js
 COPY public ./public
 
-# --- WHY: `npm install` and not `bun install` ---
-# see the stage note above — vite build needs node. the only
-# dependencies that matter for the static build are vite and the
-# preact preset.
-RUN npm install --no-audit --no-fund
+# --- WHY: `bun install --frozen-lockfile` and not `npm ci` ---
+# `npm ci` reads package-lock.json / npm-shrinkwrap.json, which this
+# repo does not have — bun owns the lockfile here (bun.lock), so npm
+# would have to re-resolve every version from the registry and could
+# produce a different tree than the one committed.
+#
+# bun reads bun.lock natively, and the `--frozen-lockfile` flag makes
+# it verify the lockfile matches package.json instead of updating it.
+RUN bun install --frozen-lockfile
 
 # produce the minified static site at /build/dist.
-RUN npm run build \
+RUN bun run build \
     && rm -rf node_modules/.vite
 
 # ========================================

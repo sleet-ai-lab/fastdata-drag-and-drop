@@ -84,8 +84,14 @@ down` loses nothing.
 
 two stages:
 
-- **builder** — `node:24-alpine`, runs `vite build` into `dist/`
+- **builder** — `oven/bun:1-alpine`, runs `vite build` into `dist/`
 - **runtime** — `nginx:alpine`, serves the built `dist/`
 
 the runtime image carries only the built site + nginx config. no bun,
 no node, no node_modules, no vite.
+
+the builder installs from the tracked `bun.lock` with
+`bun install --frozen-lockfile`, so the image always contains exactly
+the committed dependency tree. if `package.json` and `bun.lock` ever
+disagree, the build fails loudly instead of silently resolving
+something else.
