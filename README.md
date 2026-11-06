@@ -3,6 +3,8 @@
 a preact web app, built with vite. deployed as a static site behind a
 cloudflare tunnel.
 
+live at https://fastdata-drag-and-drop.shit-1170.com/
+
 ## develop
 
 ```sh
@@ -16,15 +18,24 @@ bun dev
 bun run build
 ```
 
-## deploy
-
-the app is served as static files by nginx in docker, fronted by a
-cloudflare tunnel. see [DOCKER/README.md](./DOCKER/README.md) for the
-compose commands, the tunnel token setup and the service addresses.
+## test
 
 ```sh
-docker compose -f DOCKER/docker-compose.yml up -d --build
+bun run test
 ```
+
+## deploy
+
+**run this after every change**, so what you test is what is deployed:
+
+```sh
+bun run deploy
+```
+
+it runs the tests, rebuilds the image, rolls the stack, and verifies
+that the live site serves the bundle the local build produced — so a
+stale image cannot pass silently. see
+[DOCKER/README.md](./DOCKER/README.md).
 
 services:
 

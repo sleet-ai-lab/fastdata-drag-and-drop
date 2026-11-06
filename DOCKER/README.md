@@ -13,11 +13,40 @@
 ## run it
 
 ```sh
-# from the repo root
+# from the repo root — this is the one to use
+./DOCKER/deploy.sh
+# or
+bun run deploy
+```
+
+`deploy.sh` runs the tests, rebuilds the image, rolls the stack, waits
+for the frontend to be healthy, and then **checks that the live site
+serves the bundle the local build produced**.
+
+that last check is the point. the bundle filename carries a content
+hash (`index-C9SW2e86.js`), so comparing it against the local build
+proves the deployed site is the current code and not a stale image. if
+they differ the script exits non-zero and says so, so a stale deploy
+cannot pass silently.
+
+to run the pieces by hand:
+
+```sh
 docker compose -f DOCKER/docker-compose.yml up -d --build
 docker compose -f DOCKER/docker-compose.yml logs -f
 docker compose -f DOCKER/docker-compose.yml down
 ```
+
+## deploy after every change
+
+the site you test has to be the site that is deployed. after every
+change:
+
+```sh
+bun run deploy
+```
+
+then check https://fastdata-drag-and-drop.shit-1170.com/
 
 ## the tunnel token
 

@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "bun test verify/"
+    "test": "bun test verify/",
+    "deploy": "bash DOCKER/deploy.sh"
   },
   "dependencies": {
     "@near-kit-tool-box/web": "0.3.0",

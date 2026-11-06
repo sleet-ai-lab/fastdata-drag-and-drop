@@ -22,7 +22,9 @@ dist-ssr
 
 # docs + docker files are not needed to build the image
 # (DOCKER/ is still sent — the Dockerfile and nginx.conf are read by
-# the build itself — but the compose file and README are not).
+# the build itself — but the compose file, the deploy script and the
+# README are not).
 DOCKER/docker-compose.yml
+DOCKER/deploy.sh
 DOCKER/README.md
 *.md
