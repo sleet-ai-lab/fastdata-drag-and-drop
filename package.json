@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "bun test verify/"
   },
   "dependencies": {
     "@near-kit-tool-box/web": "0.3.0",
