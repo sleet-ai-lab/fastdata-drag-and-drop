@@ -502,10 +502,20 @@ function make_sending_near(mangle = false) {
       };
     },
     async getTransactionStatus(_hash, _signer_id, _wait_until) {
-      const args = sent[sent.length - 1]?.args ?? new Uint8Array();
+      const sent_args = sent[sent.length - 1]?.args ?? "";
+
+      // we send a base64 string. the wallet decodes it and the chain
+      // ends up with the BYTES, which the rpc reports base64-encoded.
+      const decoded = new Uint8Array(Buffer.from(sent_args, "base64"));
+
+      // the mangled case models the failure we found on chain: the
+      // args went out as a JSON-wrapped base64 STRING instead of the
+      // bytes, so borsh::from_slice fails and the indexer drops the
+      // action. the file 404s and nothing says why.
       const on_chain = mangle
-        ? new TextEncoder().encode(JSON.stringify(to_base64(args)))
-        : args;
+        ? new TextEncoder().encode(JSON.stringify(to_base64(decoded)))
+        : decoded;
+
       return {
         transaction: {
           signer_id: "mob.near",
@@ -533,7 +543,7 @@ describe("fastfs upload — the whole flow", () => {
   // a base64 string here is the bug that silently kills an upload,
   // and the gas is proven on chain (the working mob.near upload
   // attached exactly 1 gas). see plan.md section 6.
-  test("the call carries raw bytes, the right method, the right gas and no signerId", async () => {
+  test("the call carries the base64 of the bytes, the right method, the right gas and no signerId", async () => {
     const near = make_sending_near();
     await FASTDATA_UPLOAD.upload_file(make_file("hello"), "/", {
       near,
@@ -545,8 +555,20 @@ describe("fastfs upload — the whole flow", () => {
     const call = near.sent[0];
     expect(call.method_name).toBe("__fastdata_fastfs");
     expect(call.receiver_id).toBe("fastfs.near");
-    expect(call.args).toBeInstanceOf(Uint8Array);
-    expect(call.args[0]).toBe(0x00);
+
+    // --- THE ARGS ARE A BASE64 STRING ---
+    // near-connect sends the transaction to the wallet as JSON, and
+    // JSON.stringify turns a Uint8Array into {"0":0,"1":9,...}. the
+    // wallet would then have to guess those numbers are bytes. a
+    // base64 string survives JSON.stringify unchanged, and the wallet's
+    // `base64-args` mode decodes it and puts the BYTES on chain.
+    //
+    // this is what the reference implementation does too.
+    expect(typeof call.args).toBe("string");
+    const decoded = new Uint8Array(Buffer.from(call.args, "base64"));
+    expect(decoded[0]).toBe(0x00);
+    expect(decoded.length).toBeGreaterThan(1);
+
     expect(call.options.gas).toBe("1");
     // near.call resolves the signer itself, so we must not pass one.
     expect(call.options.signerId).toBe(undefined);
@@ -631,8 +653,10 @@ describe("fastfs upload — several files", () => {
     const near = {
       sent: [],
       async call(receiver_id, method_name, args, options) {
-        const name = new TextDecoder().decode(args);
-        if (name.includes("b.txt")) {
+        // the args are a base64 string of the borsh bytes. the path is
+        // in there as plain ascii, so decode to find the file name.
+        const decoded = Buffer.from(args, "base64").toString("latin1");
+        if (decoded.includes("b.txt")) {
           throw new Error("the user rejected the transaction");
         }
         this.sent.push({ receiver_id, method_name, args, options });
@@ -645,7 +669,8 @@ describe("fastfs upload — several files", () => {
         };
       },
       async getTransactionStatus(_hash, _signer_id, _wait_until) {
-        const args = this.sent[this.sent.length - 1]?.args ?? new Uint8Array();
+        const sent_args = this.sent[this.sent.length - 1]?.args ?? "";
+        const decoded = new Uint8Array(Buffer.from(sent_args, "base64"));
         return {
           transaction: {
             signer_id: "mob.near",
@@ -655,7 +680,7 @@ describe("fastfs upload — several files", () => {
               {
                 FunctionCall: {
                   method_name: "__fastdata_fastfs",
-                  args: to_base64(args),
+                  args: to_base64(decoded),
                   gas: 1,
                   deposit: "0",
                 },

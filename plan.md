@@ -506,7 +506,7 @@ what we build.
 4. on-chain args        base64 of the SAME 52 raw bytes
 ```
 
-### hop 1 — near-kit keeps raw bytes
+### hop 1 — near-kit JSON-wraps anything that is not a Uint8Array
 
 `core/transaction.js:204`:
 
@@ -516,11 +516,14 @@ const argsBytes = args instanceof Uint8Array
     : new TextEncoder().encode(JSON.stringify(args));
 ```
 
-`Uint8Array` is passed through untouched. **this is why we must pass a
-`Uint8Array` and never a base64 string.** a base64 string would be
-`JSON.stringify`'d into a JSON string and the file would be garbage.
+so:
+- a `Uint8Array` goes through untouched
+- **a base64 string becomes `JSON.stringify`'d — i.e. `"AAkA..."` WITH
+  QUOTES — as bytes**
 
-### hop 2 — the JSON.parse branch (the dangerous one)
+and that turns out to be exactly what we want. see hop 2.
+
+### hop 2 — the JSON.parse branch, and why it helps here
 
 `wallets/adapters.js:26-35`:
 
@@ -536,27 +539,91 @@ if (args instanceof Uint8Array) {
 }
 ```
 
-this **tries to parse the borsh bytes as JSON**. for our payload the
-parse fails (borsh bytes are not valid JSON) and the catch keeps the raw
-bytes. that is the correct outcome, but it depends on the payload
-happening to be invalid JSON.
+the adapter tries to read the args back as JSON. because we sent a
+base64 string, near-kit made them the JSON text `"AAkA..."`, and this
+parse **succeeds** — giving the plain base64 string back.
 
-**this is the trap to be careful about.** a borsh payload that *did*
+so the wallet receives an unambiguous base64 string:
+
+```
+"AAkAAABIZWxsby50eHQBCgAAAHRleHQvcGxhaW4FAAAAaGVsbG8="
+```
+
+**and that is the shape the wallet's `base64-args` mode expects.** it
+decodes it and puts our exact bytes on chain.
+
+### the shape that does NOT work, and why we found it
+
+if we send the raw `Uint8Array` instead, near-kit passes it through
+untouched, and then near-connect's `JSON.stringify` over the actions
+turns it into an object keyed by byte index:
+
+```json
+{ "0": 0, "1": 9, "10": 46, "11": 116, "12": 120, ... }
+```
+
+**that is exactly what the Intear wallet showed us.** it renders the
+args as `json-args '{...}'`, and there is nothing in that object saying
+"these numbers are the bytes". the wallet would have to guess.
+
+this was a real bug in our first implementation, and it was found by
+looking at the wallet's approve screen rather than by reading the
+near-connect source carefully enough.
+
+### the shape that DID fail on chain, and it is a different one
+
+the `sleet.near` upload that 404s has 74 bytes of **quoted** base64
+on chain:
+
+```
+"AA8AAABub3Rlcy9zbWFsbC50eHQBCgAAAHRleHQvcGxhaW4NAAAAaGVsbG8gZmFzdGZzCg=="
+```
+
+with the quotes as bytes 0 and 73. that is the JSON-string shape —
+what near-kit produces from a base64 string — but it went through
+**wallet-selector**, whose `stringifyJsonOrBytes` JSON-wrapped it
+again, and then the wallet put THAT on chain.
+
+so there are two distinct failures, and they are not the same bug:
+
+| what was sent | which wallet | what landed on chain | result |
+| --- | --- | --- | --- |
+| base64 string | wallet-selector | `"AAkA..."` with quotes, 74 bytes | **404** — indexer drops it |
+| raw `Uint8Array` | near-connect | `{"0":0,"1":9,...}` | the wallet has to guess — not what the wallet's `base64-args` mode expects |
+| **base64 string** | **near-connect** | **our exact bytes** | **works** |
+
+the rule, then:
+
+> **the args to near.call must be the BASE64 STRING of the borsh
+> bytes.** the wallet decodes it and puts the bytes on chain.
+
+this is also what the reference implementation does, and the reference
+works.
+
+### the trap to be careful about
 happen to parse as JSON would be converted to a JS object and the wallet
 would sign a completely different transaction. our payload starts with
 `0x00 0x0f 0x00 0x00 0x00` (the enum discriminant + string length),
 which is never valid JSON, so we are safe — but the property we depend
 on is "the bytes are not valid JSON", not "the code preserves bytes".
 
-> **rule:** the payload must stay a `Uint8Array` end to end. never
-> base64 it, never JSON it, never let it become a string. we add a
-> regression check for this in step 2 (section 8).
+> **rule (as first written, and WRONG):** the payload must stay a
+> `Uint8Array` end to end. never base64 it, never JSON it, never let it
+> become a string.
+>
+> **this was wrong.** see hop 1 and hop 2 above. we send the base64
+> string, and that is what lands the bytes. the reasoning that led us
+> here was sound but the conclusion was inverted: we concluded "a string
+> gets JSON-wrapped and the file becomes garbage", without following
+> the JSON-wrapped string through the adapter's JSON.parse (which
+> SUCCEEDS and undoes the wrapping) and into the wallet's
+> `base64-args` mode (which decodes it correctly).
 
 ### hop 3 — near-connect does the same check again
 
 `@hot-labs/near-connect` `actions/index.js:5-10` has the identical
-`deserializeArgs` logic. same outcome: the parse fails, the raw bytes
-survive.
+`deserializeArgs` logic. same outcome: the parse succeeds and the plain
+base64 string survives to the wallet.
 
 ### hop 4 — what actually lands on chain
 
@@ -617,13 +684,31 @@ so the rule is absolute:
 
 > **the args must be raw `Uint8Array` bytes. never a base64 string,
 > never JSON, never a string of any kind.**
+>
+> **this was wrong too — see the corrected rule above.** the base64
+> string is what we send.
 
-the spec's own example makes the same point — it base64s the bytes
-with `near.utils.bytesToBase64(serializedData)` because **that
-example calls `near.functionCall` directly**, where the args are a
-JSON field and must be base64. the reference app copies that base64
-into a *different* API (`callFunction`), where it gets double-encoded
-and the upload breaks.
+the spec's own example base64s the bytes with
+`near.utils.bytesToBase64(serializedData)` because **that example
+calls `near.functionCall` directly**, where the args are a JSON field
+and must be base64.
+
+**and the reference app does the same thing** — it base64s the borsh
+bytes and passes the base64 string to `callFunction`:
+
+```js
+const ffs64 = encodeFfs(part);
+await callFunction({ contractId, method: "__fastdata_fastfs", args: ffs64, gas: "1" });
+```
+
+**and the reference WORKS.** so the base64 string is not the bug — the
+bug was sending a base64 string through a path that JSON-wraps it a
+SECOND time (wallet-selector's `stringifyJsonOrBytes`). with
+near-connect the wrapping happens once and the adapter's JSON.parse
+undoes it, so the wallet receives the clean base64 string.
+
+we are now doing exactly what the reference does, over a different
+wallet stack.
 
 ### the verification we ran
 
@@ -678,7 +763,7 @@ and the upload will not land.
     type: "FunctionCall",
     params: {
       methodName: "__fastdata_fastfs",
-      args:        Uint8Array(52),   // raw borsh, NOT json, NOT base64
+      args:        "AAkAAABIZWxsby50eHQBCgAAAHRleHQvcGxhaW4F...",  // base64
       gas:        "1",
       deposit:    "0",
     },
@@ -686,49 +771,47 @@ and the upload will not land.
 }
 ```
 
+**the args are a base64 STRING.** the wallet's cli formatter has a
+`base64-args` mode for exactly this, decodes it, and puts the raw
+borsh bytes on chain.
+
 `receiverId` is the transaction's receiver — the namespace account. the
 wallet shows the user "call `__fastdata_fastfs` on `fastfs.near`". that
 is the transaction the user is approving, and it is the transaction
 that lands on chain.
 
-### CONFIRMED IN A REAL WALLET
+### CONFIRMED IN A REAL WALLET — and it showed the BUG
 
 we connected the real Intear wallet on testnet and looked at the args
-it was asked to sign. the wallet renders the args as an object keyed
-by byte index:
+it was asked to sign. the wallet rendered them as an object keyed by
+byte index:
 
 ```json
 { "0": 0, "1": 6, "10": 103, "100": 116, "1000": 102, "10000": 20 }
 ```
 
-**that is a `Uint8Array` rendered as JSON** — `Object.fromEntries(
-Array.from(bytes).map((b, i) => [i, b]))`. the values are raw byte
-numbers keyed by their index.
+**we read that as "the wallet received raw bytes, so we are correct".**
+that reading was WRONG.
 
-reading it against the borsh layout:
+what it actually means is that near-connect's `JSON.stringify` turned
+our `Uint8Array` into that object. the wallet was showing us a
+`json-args '{...}'` — a JSON object — and its own cli formatter has a
+`base64-args` mode it never got to use, because nothing told it these
+numbers were the bytes.
 
-| byte | value | what it is |
-| --- | --- | --- |
-| 0 | 0 | the enum discriminant — **`simple`**, correct |
-| 1 | 6 | the low byte of the path length (u32 little-endian) |
-| 10 | 103 = `g` | inside the relative path |
-| 100 | 116 = `t` | inside the mime type |
-| 1000 | 102 = `f` | inside the mime type |
-| 10000 | 20 | inside the file content |
-
-and this is exactly what our own encoder produces for the same shape:
+the giveaway was the CLI command the wallet produced:
 
 ```
-{"0":0,"1":8,"2":0,"3":0,"4":0,"5":116,"6":101,"7":115,"8":116,"9":46,"10":116,...
+near contract call-function as-transaction fastfs.testnet \
+  __fastdata_fastfs json-args '{"0":0,"1":9,...}'
 ```
 
-**if the args had been sent as a string (the bug), the wallet would
-show one long string value** — `"AA8AAABub3Rlcy9zbWFsbC50eHQB..."` —
-not an object of byte-indexed numbers. it shows the latter.
+**`json-args`** — not `base64-args`. and the args are the byte-indexed
+object, not a base64 string.
 
-so the wallet received raw bytes. the args are correct. this is the
-strongest confirmation we have, because it is the consumer itself
-telling us what it got.
+so the wallet received something ambiguous, and the fix is to send the
+base64 string so it receives something unambiguous. which is what the
+reference implementation does, and the reference works.
 
 ### CONFIRMED AGAIN ON THE DEPLOYED SITE
 
@@ -775,6 +858,15 @@ byte 5.. = the path
 
 **the two match.** byte 0 being `0` and byte 1 being the path length
 is the signature of a correct `simple` payload.
+
+**so the BYTES we build were always right.** what was wrong was how
+they were handed to the wallet — they were handed over as a
+`Uint8Array`, which near-connect's `JSON.stringify` flattened into
+that byte-indexed object. the fix is to hand over the base64 string
+instead, so the wallet receives something unambiguous and puts the
+bytes on chain.
+
+the args were never wrong. the CONTAINER was.
 
 ### the `<0.001 Tgas` is correct too
 
@@ -1192,8 +1284,9 @@ guarantees the bytes we build are the bytes that land on chain.
       with `0x00`, not with a `"` quote — the failed upload started
       with a quote and 404s. section 3b.
 - [x] **3. port the upload.** create `src/fastfs/upload.js`. call
-      `near.call(receiver, "__fastdata_fastfs", bytes, { gas: "1" })`
-      with `bytes` a `Uint8Array` — never a base64 string.
+      `near.call(receiver, "__fastdata_fastfs", base64_string, { gas: "1" })`
+      where `base64_string` is the base64 of the borsh bytes. section
+      3b — this is the part that was wrong first time round.
 - [x] **4. the validation layer.** `src/fastfs/validate.js`. size over
       1 MB, empty mime type, relative path over 1024 bytes, more than
       10 files. each rejection names the limit that was hit. this is
