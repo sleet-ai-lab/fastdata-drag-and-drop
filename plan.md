@@ -29,10 +29,11 @@ the reference is `fastfs-upload-demo`. it:
 | reference | file | what we keep |
 | --- | --- | --- |
 | the FastFS borsh schema | `src/hooks/fastfs.js` | the exact schema + `encodeFfs` |
-| the chunking rules | `src/Upload/Upload.jsx` | 1 MiB chunks, `nonce`, part offsets |
 | the `__fastdata_fastfs` call | `src/Upload/Upload.jsx` | method name + borsh args |
 | the file URL shape | `src/Upload/Upload.jsx` | `https://{account}.fastfs.io/...` |
 | the ui shape | `src/Upload/Upload.jsx` | drop zone, relative path, file list, progress |
+| the size caps | `src/Upload/Upload.jsx` | 32 MB drop zone, 10 files per drop |
+| the chunking rules | `src/Upload/Upload.jsx` | **not** — we use `simple` only (section 2) |
 
 ### what we change
 
@@ -163,8 +164,7 @@ FastfsData = enum {
 
 the reference also has a `partial` variant with `offset` / `fullSize` /
 `contentChunk` / `nonce`, for files over 1 MiB. the spec does not
-document `partial` — it says "File Size: Be mindful of NEAR transaction
-size limits" and points at separate transactions per file instead.
+document `partial`.
 
 we skip `partial`. one transaction per file, one `simple` entry. the
 consequence is that a big file is one transaction carrying the whole
@@ -176,6 +176,82 @@ so the enum discriminant ordering stays identical to the working
 transaction. `partial` is variant 1, `simple` is variant 0, and the
 working upload's args start with `0x00` — so `simple` must stay
 first in the enum.
+
+### what we verified on chain about both variants
+
+we pulled real `__fastdata_fastfs` transactions and decoded their args
+by hand. both variants are real, and both appear in the wild:
+
+| tx | variant | bytes | decoded | file serves? |
+| --- | --- | --- | --- | --- |
+| `5vUqtNhY...` | **simple** | 121512 | `fastnear.png`, `image/png`, 121477 B | **yes** — 200 |
+| `AihzkJKoG...` | **simple** | 677305 | `524abc0d....wasm`, `application/wasm`, 677206 B | — |
+| `Ho9MvXs21...` | **partial** | 1048679 | `3e1857b8....mp3`, `audio/mpeg`, offset 2097152, fullSize 6153298, chunk 1048576 B, nonce 3142720738 | 404 — see below |
+
+the `partial` one decodes exactly like the reference builds it: a
+**1 MiB chunk** (`1048576`), an **offset** that is a multiple of 1 MiB
+(`2097152` = chunk 2), the **fullSize** of the whole file
+(`6153298`), and a **nonce**.
+
+its 404 is **correct**, not a bug: the file is 6153298 bytes, so it
+needs 6 chunks, and that transaction only carried chunk 2. the file is
+incomplete, so the server has nothing complete to serve.
+
+**this tells us the `partial` format is real and the indexer reads
+it.** we are still skipping it, because it doubles the code and the
+nonce/offset bookkeeping for a case we do not need.
+
+### the size limit, from the protocol
+
+we confirmed the hard limit on live mainnet via
+`EXPERIMENTAL_protocol_config`:
+
+```
+runtime_config.wasm_config.limit_config.max_transaction_size = 1572864
+```
+
+**1572864 bytes = exactly 1.5 MiB.** that is the total size of the
+signed transaction, so the file's content has to fit inside it along
+with the envelope (signer id, public key, nonce, receiver id, block
+hash, signature — roughly 300 bytes) and the borsh header for the
+path and mime type (tens of bytes).
+
+**so with `simple` only, the usable file size is about 1.5 MB.** a
+file bigger than that cannot be sent in one transaction at all — the
+network rejects it before it is signed.
+
+this also explains the reference's design: its 1 MiB chunk size sits
+inside the 1.5 MiB limit with ~512 KB to spare, which is exactly why
+it chunks at 1 MiB.
+
+### what "small like the reference" means for us
+
+- **per-file cap: 1 MB** (1048576 bytes). that is under the 1.5 MiB
+  protocol limit with a wide margin, it matches the reference's own
+  chunk boundary, and it is comfortably above the largest `simple`
+  upload we found on chain (677 KB).
+- **outer drop-zone cap: 32 MB**, same as the reference, so a drag
+  that includes a huge file is rejected with a clear message rather
+  than silently failing.
+- **max 10 files per drop**, same as the reference.
+- the ui says which limit was hit, per file.
+
+we support: **small files, one transaction each, `simple` only.** that
+is exactly what the reference does for anything under 1 MiB, and it is
+the only path we have verified end to end (a served file).
+
+### the `partial` path — real, but skipped
+
+for completeness, since we found it on chain: `partial` is a real
+format that the indexer reads, and the reference implements it
+correctly. its 404 on chain was correct behaviour — that transaction
+carried chunk 2 of 6, so the file was incomplete.
+
+we skip it. it doubles the code (offset bookkeeping, the shared
+nonce, the last-chunk detection) for a case we do not need, and the
+`simple` path is the one we have seen produce a served file. if we
+ever want big files, this is the design to follow, and the schema is
+already in place for it.
 
 ### validation rules (from the spec)
 
@@ -845,19 +921,18 @@ guarantees the bytes we build are the bytes that land on chain.
    transaction. section 6.
 4. **network toggle** — no page reload; per-connector listener set.
    section 4.
+5. **size** — small files, like the reference does for anything under
+   1 MiB. the `partial` chunking path exists and works on chain, but
+   we skip it. per-file cap 1 MB, outer drop-zone cap 32 MB, max 10
+   files per drop. section 2.
 
 ### still open
 
-1. **the max file size.** with `simple` only, the whole file goes in
-   one transaction, so NEAR's transaction size limit applies. the
-   reference caps the drop zone at 32 MB. we need to pick a cap and
-   show it in the ui. (the working png was 121 KB — small files are
-   proven, large ones are not.)
-2. **the mime type for files the browser gives no type for.** the spec
+1. **the mime type for files the browser gives no type for.** the spec
    requires a non-empty `mimeType` and rejects the transaction
    otherwise. we need a fallback for extensionless or unknown-type
    files.
-3. **the relative path.** the reference has a user-editable relative
+2. **the relative path.** the reference has a user-editable relative
    path field, defaulting to `/`. we should keep that — the path is
    part of the served url.
 
@@ -901,6 +976,8 @@ sent as a base64 string instead of raw bytes. that failure is silent
   and the wallet listeners follow the connector
 - the ui shows the network of the connected account
 - dropping a file shows it staged with its size and type
+- a file over 1 MB is rejected with a clear message naming the limit
+- more than 10 files in one drop is rejected the same way
 - a failed upload shows the error instead of silently failing
 
 ==========================
