@@ -720,21 +720,74 @@ must be the same account that signed, so we read it from the same
   `getTransactionStatus(hash, signer_id, waitUntil)`. it never asks the
   user to sign again.
 
-so we get back a result we can inspect. but here is the trap we
-already found in section 2:
+so we get back a result with the **tx hash** in it. that is the one
+thing we always have.
 
-> `outcomes.status` is **`false`** even on uploads that worked.
+### how the reference does it, and why we do a bit more
 
-the reason is that the receiver has no contract, so the function call
-has no successful return value to report. `near-kit`'s `send()` will
-therefore look like a failure and fall through to the RPC reconcile
-path, which is fine — but we must not treat the status as the success
-signal.
+the reference **does not verify anything**:
 
-**the success signal is the served file.** after the transaction is
-included, we fetch the file url and compare the bytes to what we
-uploaded. that is the only trustworthy end-to-end check, and it is
-what "landed on chain" has to mean for us.
+```js
+await callFunction({ ... })
+  .catch(() => {})                       // <- swallows every error
+  .finally(() => {
+    file.uploadedParts += 1;
+    if (file.uploadedParts === file.numParts) {
+      file.uploads = file.status = Status.Success;   // <- "success"
+      file.url = `https://${accountId}.fastfs.io/...`;  // <- url is guessed
+    }
+  });
+```
+
+it marks the file **Success** as soon as the promise settles, builds
+the url from the account and the path, and never checks that the file
+is actually served. a transaction the indexer silently dropped looks
+exactly like a successful upload.
+
+we do one cheap extra check, because it is the thing that catches the
+exact failure mode we found on chain.
+
+### what we verify — one check, in the app
+
+**we pull the transaction back and compare its args to our bytes.**
+
+```js
+const status = await near.getTransactionStatus(hash, signer_id, "INCLUDED");
+const args = status.transaction.actions[0].FunctionCall.args;
+```
+
+the chain returns the action's args as the raw bytes it was given, so
+comparing them to what we built is a direct, exact check.
+
+- **args match our bytes** -> the encoding we built is the encoding
+  the chain got. the upload is real.
+- **args do not match** -> something mangled them on the way. that is
+  the base64 bug, and we show an error instead of a success link.
+
+this is one extra RPC call, it needs no server, and it works on
+**testnet too** — which is the point. the FastFS server does not serve
+testnet files, so a "fetch the url" check would fail there for a
+perfectly good upload. checking the args does not.
+
+### and then you check it by hand
+
+the app does the args check. **the human does the final check** — open
+the url and see the file. that is the verification we cannot automate
+without a server, and it is the one that actually matters.
+
+so the flow is:
+
+| step | who | what |
+| --- | --- | --- |
+| 1 | app | builds the bytes, sends the tx, gets the hash |
+| 2 | app | pulls the tx back, compares the args to our bytes |
+| 3 | app | shows the url |
+| 4 | **you** | open the url on mainnet, see the file |
+
+on **testnet**, step 2 is the whole verification — the args either
+match or they do not. step 4 is not available there (the server does
+not serve testnet), and that is fine, because step 2 is what proves
+the encoding is right.
 
 ### what "done" means for the transaction path
 
@@ -1085,6 +1138,15 @@ guarantees the bytes we build are the bytes that land on chain.
    message. no extension-based guessing. section 2.
 7. **relative path** — editable, like the reference. the path is part
    of the served url, so it is worth letting the user set it.
+8. **verification** — one check in the app (compare the on-chain args
+   to our bytes), and the final check is manual: open the url and see
+   the file. no server. section 3b.
+9. **testnet first** — the network toggle is there from the start, so
+   the flow is: switch to testnet, upload, and the app's args check
+   confirms the encoding. then switch to mainnet and open the url to
+   confirm the file is served. the FastFS server does not serve
+   testnet files, which is exactly why the args check is the one we
+   automate.
 
 ### still open
 
@@ -1124,19 +1186,20 @@ these give us the exact contract our app has to satisfy. section 2.
 - the wallet signs with the connected account, and that account is the
   one in the resulting url
 - the transaction is **included in a block**
-- **pulling the tx back from the chain and base64-decoding its args
-  gives byte-for-byte the same bytes we built.** this is the direct
-  check that what we encoded is what landed
+- **the app pulls the tx back and compares the action's args to the
+  bytes we built.** they match, byte for byte. this is the check that
+  catches the silent failure
 - **the decoded args start with `0x00`, not with `0x22` (`"`).** if
   they start with a quote, we sent a string and the upload will 404
-- the file is served at
-  `https://{account}.fastfs.io/{namespace}/{path}` and the served
-  bytes match what we uploaded
+- the app shows the url
+- **a human opens the url on mainnet and sees the file.** that last
+  step is manual on purpose — the app does not need a server to
+  verify its own encoding, and the person testing checks the rest
 - a `status: false` receipt is **not** treated as a failure, and not
-  treated as success either — it tells us nothing. the success signal
-  is the served file
-- if the tx args or the served bytes do not match, the ui reports the
-  upload as failed. it does not show a success link
+  treated as success either — it tells us nothing. the args check is
+  the signal
+- if the args do not match, the ui reports the upload as failed. it
+  does not show a success link
 
 **the failure mode to avoid** is the one we found on chain: a
 transaction with the right method, the right gas, the right receiver
