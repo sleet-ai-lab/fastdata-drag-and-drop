@@ -691,6 +691,45 @@ wallet shows the user "call `__fastdata_fastfs` on `fastfs.near`". that
 is the transaction the user is approving, and it is the transaction
 that lands on chain.
 
+### CONFIRMED IN A REAL WALLET
+
+we connected the real Intear wallet on testnet and looked at the args
+it was asked to sign. the wallet renders the args as an object keyed
+by byte index:
+
+```json
+{ "0": 0, "1": 6, "10": 103, "100": 116, "1000": 102, "10000": 20 }
+```
+
+**that is a `Uint8Array` rendered as JSON** — `Object.fromEntries(
+Array.from(bytes).map((b, i) => [i, b]))`. the values are raw byte
+numbers keyed by their index.
+
+reading it against the borsh layout:
+
+| byte | value | what it is |
+| --- | --- | --- |
+| 0 | 0 | the enum discriminant — **`simple`**, correct |
+| 1 | 6 | the low byte of the path length (u32 little-endian) |
+| 10 | 103 = `g` | inside the relative path |
+| 100 | 116 = `t` | inside the mime type |
+| 1000 | 102 = `f` | inside the mime type |
+| 10000 | 20 | inside the file content |
+
+and this is exactly what our own encoder produces for the same shape:
+
+```
+{"0":0,"1":8,"2":0,"3":0,"4":0,"5":116,"6":101,"7":115,"8":116,"9":46,"10":116,...
+```
+
+**if the args had been sent as a string (the bug), the wallet would
+show one long string value** — `"AA8AAABub3Rlcy9zbWFsbC50eHQB..."` —
+not an object of byte-indexed numbers. it shows the latter.
+
+so the wallet received raw bytes. the args are correct. this is the
+strongest confirmation we have, because it is the consumer itself
+telling us what it got.
+
 ### how the signer is picked
 
 `near.call` resolves the signer itself (`core/near.js:169-185`):

@@ -463,6 +463,34 @@ export async function upload_file(file, relative_path, options = {}) {
   let tx_signer_id = null;
   let tx_actions = null;
   try {
+    // --- WHAT IS ABOUT TO GO TO THE WALLET ---
+    //
+    // this is the log to read when checking that the args are right.
+    // it shows the type, the length and the first byte, which are the
+    // three things that tell you whether the payload will survive:
+    //
+    //   type   Uint8Array  -> survives (the raw bytes)
+    //   type   string      -> the indexer will drop it, the file 404s
+    //   first  0x00        -> the `simple` enum discriminant, correct
+    //   first  0x22        -> a quote, so it was sent as a string
+    console.info("[fastdata] sending to the wallet:", {
+      receiver: receiver_id,
+      method: METHOD_NAME,
+      gas: GAS,
+      args_type: bytes?.constructor?.name,
+      args_length: bytes?.length,
+      first_byte: bytes?.length ? `0x${bytes[0].toString(16).padStart(2, "0")}` : null,
+      // the first bytes as hex, so the borsh header is readable in the
+      // console. NOT the whole payload: a 1 MB file as hex would be
+      // unreadable, and spreading it into fromCharCode would blow the
+      // argument limit.
+      args_head_hex: bytes
+        ? Array.from(bytes.subarray(0, 24))
+            .map((b) => b.toString(16).padStart(2, "0"))
+            .join(" ")
+        : null,
+    });
+
     const result = await near.call(receiver_id, METHOD_NAME, bytes, {
       gas: GAS,
     });

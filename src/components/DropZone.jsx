@@ -84,7 +84,6 @@ export function DropZone({ on_files, disabled }) {
     event.stopPropagation();
     if (!disabled) set_dragging(true);
   }
-
   function handle_drag_leave(event) {
     event.preventDefault();
     event.stopPropagation();
