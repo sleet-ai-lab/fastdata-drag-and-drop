@@ -730,6 +730,67 @@ so the wallet received raw bytes. the args are correct. this is the
 strongest confirmation we have, because it is the consumer itself
 telling us what it got.
 
+### CONFIRMED AGAIN ON THE DEPLOYED SITE
+
+we did the same thing against the live site
+(https://fastdata-drag-and-drop.shit-1170.com/) with a real file, and
+the Intear wallet's approve screen showed:
+
+```
+Transaction to  fastfs.testnet
+  1. Call '__fastdata_fastfs' with <0.001 Tgas
+     {
+       "0": 0,
+       "1": 30,
+       "10": 110,
+       "100": 100,
+       "1000": 241,
+       "10000": 34,
+       "100000": 14,
+       "100001": 203,
+       ...
+     }
+```
+
+reading it against the borsh layout of a `simple` payload:
+
+| byte | value | what it is |
+| --- | --- | --- |
+| 0 | **0** | the enum discriminant — **`simple`** |
+| 1 | **30** | the low byte of the path length (u32 little-endian) |
+| 10 | 110 = `n` | inside the relative path |
+| 100 | 100 = `d` | inside the mime type |
+| 1000 | 241 | inside the file content |
+| 10000 | 34 = `"` | inside the file content |
+| 100000+ | 14, 203, 198, 207… | the file content |
+
+and the layout our own encoder produces for a 30-char path:
+
+```
+byte 0   = 0    the enum discriminant
+byte 1   = 30   the path length u32 LE
+byte 2-4 = 0 0 0
+byte 5.. = the path
+```
+
+**the two match.** byte 0 being `0` and byte 1 being the path length
+is the signature of a correct `simple` payload.
+
+### the `<0.001 Tgas` is correct too
+
+the wallet shows the gas we attached, which is `"1"` — one gas unit.
+1 Tgas is 1e12 gas units, so 1 gas unit is 0.000000000001 Tgas, which
+the wallet renders as `<0.001 Tgas`.
+
+**that is the same gas the reference uses, and the same gas the
+working mainnet transaction used** (`mob.near` -> `fastfs.near`,
+`gas_attached: 1`, which used 7.49 TGas — the receiver has no
+contract, so nothing is burned and the protocol refunds the rest).
+
+a wallet showing `<0.001 Tgas` is what a correct fastfs upload looks
+like. if it showed `300 Tgas` that would be the spec's default, which
+also works but is not what we send.
+
 ### how the signer is picked
 
 `near.call` resolves the signer itself (`core/near.js:169-185`):

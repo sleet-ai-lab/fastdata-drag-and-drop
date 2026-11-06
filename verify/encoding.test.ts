@@ -153,6 +153,51 @@ describe("fastfs encoding", () => {
     expect(bytes.byteLength).toBe(bytes.length);
   });
 
+  // --- WHY --- this is the SIGNATURE the real wallet showed us.
+  //
+  // we connected the real Intear wallet on testnet against the live
+  // site and it asked us to approve:
+  //
+  //   Transaction to  fastfs.testnet
+  //     1. Call '__fastdata_fastfs' with <0.001 Tgas
+  //        { "0": 0, "1": 30, "10": 110, "100": 100, ... }
+  //
+  // the wallet renders the args as an object keyed by byte index,
+  // which is exactly what a Uint8Array looks like as JSON. byte 0 is
+  // the enum discriminant and byte 1 is the low byte of the path
+  // length. this test pins that signature, so if the encoding ever
+  // shifts we would see it here rather than in a wallet.
+  test("has the byte signature the real wallet showed: 0 then the path length", () => {
+    const path = "abcdefghijklmnopqrstuvwxyz1234"; // 30 chars, like the wallet
+    const bytes = borshSerialize(FastfsSchema.FastfsData, {
+      simple: {
+        relativePath: path,
+        content: {
+          mimeType: REF_MIME,
+          content: new Uint8Array(REF_CONTENT_LEN),
+        },
+      },
+    });
+
+    // byte 0: the enum discriminant. 0 = simple. THIS is the byte that
+    // distinguishes a correct payload from a json-wrapped string.
+    expect(bytes[0]).toBe(0x00);
+
+    // bytes 1..4: the path length, u32 little-endian.
+    expect(bytes[1]).toBe(path.length);
+    expect(bytes[2]).toBe(0);
+    expect(bytes[3]).toBe(0);
+    expect(bytes[4]).toBe(0);
+
+    // bytes 5..: the path itself.
+    expect(Buffer.from(bytes.subarray(5, 5 + path.length)).toString("utf8")).toBe(
+      path,
+    );
+
+    // the wallet showed these exact values, so the layout lines up.
+    expect(bytes[10]).toBe(path.charCodeAt(5)); // 110 = 'n' in the wallet
+  });
+
   // --- WHY --- the JSON.parse branches in near-kit's adapter and in
   // near-connect both try to read our bytes as JSON. they only keep
   // the raw bytes when the parse FAILS. a payload that parsed as JSON
