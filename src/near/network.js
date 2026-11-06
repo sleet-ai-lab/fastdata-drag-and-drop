@@ -32,6 +32,7 @@ import {
   set_network_testnet,
   toggle_network,
 } from "@near-kit-tool-box/web";
+import { FASTDATA_WALLET } from "./wallet.js";
 
 // ========================================
 // the receiver account (the "namespace") per network.
@@ -131,14 +132,15 @@ export function toggle() {
 // wallet:signIn / wallet:signOut — the exact trap the tool box's own
 // auth_status.ts warns about.
 //
-// the import is DYNAMIC so the two modules do not form a cycle: the
-// wallet module does not need to know about the network module.
+// the import is STATIC, not dynamic: the wallet module does not import
+// the network module, so there is no cycle to avoid. (a dynamic import
+// here only produced a bundler warning, since the module is imported
+// statically elsewhere anyway.)
 //
-// this is best effort. if the wallet module cannot be loaded we still
+// this is best effort. if the wallet module cannot attach we still
 // want the network to have flipped.
-async function attach_wallet_listeners_for_current_network() {
+function attach_wallet_listeners_for_current_network() {
   try {
-    const { FASTDATA_WALLET } = await import("./wallet.js");
     FASTDATA_WALLET.init();
   } catch (error) {
     console.warn("[fastdata] could not re-attach wallet listeners:", error);

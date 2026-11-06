@@ -199,6 +199,28 @@ export function validate_drop(files) {
 // ========================================
 
 // ========================================
+// validate the relative path on its own.
+//
+// WHY THIS EXISTS SEPARATELY: the relative path is EDITABLE, so the
+// user can make it too long AFTER the files are dropped. the drop-time
+// check would have passed. so the path is checked again right before
+// we build the transaction.
+//
+// returns null when the path is fine, otherwise { code, message }.
+export function validate_relative_path(relative_path) {
+  if (relative_path === undefined || relative_path === null) return null;
+  const path_length = byte_length(relative_path);
+  if (path_length > MAX_RELATIVE_PATH_LENGTH) {
+    return {
+      code: ERROR_CODES.RELATIVE_PATH_TOO_LONG,
+      message: `the relative path is too long: ${path_length} bytes, the limit is ${MAX_RELATIVE_PATH_LENGTH} bytes`,
+    };
+  }
+  return null;
+}
+// ========================================
+
+// ========================================
 // the module's public surface, as one object.
 //
 // the drop zone imports this and calls what it needs:
@@ -214,6 +236,7 @@ export const FASTDATA_VALIDATE = {
   ERROR_CODES,
   validate_file,
   validate_drop,
+  validate_relative_path,
 };
 // ========================================
 // copyright 2026 by sleet.near
