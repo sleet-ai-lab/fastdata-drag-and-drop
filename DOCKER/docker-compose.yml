@@ -1,0 +1,99 @@
+# docker-compose.yml — frontend + cloudflare tunnel.
+#
+# run from the repo root:
+#   docker compose -f DOCKER/docker-compose.yml up -d --build
+#   docker compose -f DOCKER/docker-compose.yml logs -f
+#   docker compose -f DOCKER/docker-compose.yml down
+#
+# there is no persistent state here: the vite build is baked into the
+# image and nginx serves it as static files. no database, no volume.
+#
+# ACCESS: nothing is published to the host on purpose. the site is
+# reachable only through the cloudflare tunnel over https. to reach it
+# another way while debugging, uncomment the `ports:` block on
+# fastdata-drag-and-drop-frontend below.
+#
+# SERVICE ADDRESSES (use these as the "Service URL" in the cloudflare
+# dashboard route configuration):
+#
+#     frontend  ->  http://fastdata-drag-and-drop-frontend:80
+#     tunnel    ->  http://fastdata-drag-and-drop-cloudflare:80
+#
+# the tunnel container does not serve the site itself — it proxies to
+# the frontend container over the compose network. point the route at
+# the frontend address above.
+
+name: fastdata-drag-and-drop
+services:
+  # ----------------------------------------
+  # the frontend: the vite build served by nginx.
+  # ----------------------------------------
+  fastdata-drag-and-drop-frontend:
+    build:
+      context: ..
+      dockerfile: DOCKER/Dockerfile
+    image: fastdata-drag-and-drop/fastdata-drag-and-drop-frontend:0.1.0
+    container_name: fastdata-drag-and-drop-frontend
+    restart: unless-stopped
+
+    # NO `ports:` here on purpose — the site is not published to the
+    # host. cloudflared reaches it over the compose network by
+    # container name (see the tunnel's route below), so port 80 never
+    # touches the host's network stack.
+    #
+    # to debug locally over http, uncomment:
+    # ports:
+    #   - "8080:80"
+
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
+  # ----------------------------------------
+  # cloudflare tunnel — the only way in.
+  #
+  # the token below authenticates cloudflared to your tunnel and
+  # fetches its hostname/ingress config from Cloudflare, so the route
+  # that points at this service is configured in the CLOUDFLARE
+  # dashboard, not here. for that dashboard route's "Service URL",
+  # use the frontend container name and port:
+  #
+  #     http://fastdata-drag-and-drop-frontend:80
+  #
+  # (NOT localhost — cloudflared is a separate container and has its
+  # own loopback that nothing else is listening on. the container
+  # name resolves over the compose network's internal DNS.)
+  #
+  # the scheme is http: the browser's hop to cloudflare's edge is
+  # https (terminated at the edge), but this edge-to-origin hop runs
+  # inside the compose network, where plain http is fine.
+  # ----------------------------------------
+  fastdata-drag-and-drop-cloudflare:
+    image: cloudflare/cloudflared:latest
+    container_name: fastdata-drag-and-drop-cloudflare
+    restart: unless-stopped
+
+    # --- WHY the token comes from the environment, not `--token` ---
+    # `command: ... --token ${CLOUDFLARE_TUNNEL_TOKEN}` looks natural
+    # but breaks: compose only auto-loads a `.env` sitting NEXT TO this
+    # compose file (in DOCKER/), and `${...}` is interpolated when
+    # compose parses the file — before the service's env_file is read.
+    # the result was an EMPTY token and a cloudflared container that
+    # just printed its own help text.
+    #
+    # cloudflared reads $TUNNEL_TOKEN by itself, so `.env` defines the
+    # variable under exactly that name and env_file hands it straight
+    # through. no interpolation, so it works from any directory and
+    # cannot half-configure.
+    command: tunnel --no-autoupdate run
+    env_file:
+      # the repo-root `.env` (one level up from this file). it defines
+      # TUNNEL_TOKEN, which is the name cloudflared looks for.
+      - ../.env
+    depends_on:
+      fastdata-drag-and-drop-frontend:
+        condition: service_healthy
+# ========================================

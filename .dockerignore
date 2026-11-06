@@ -1,0 +1,28 @@
+# ========================================
+# .dockerignore — keep the build context small and the image cache useful.
+#
+# `node_modules` and `dist` are rebuilt inside the image (npm install /
+# vite build), so shipping the host copies would only bloat the
+# context and risk the image picking up host-platform binaries.
+# ========================================
+.git
+.gitignore
+node_modules
+dist
+dist-ssr
+
+# local env / editor noise
+.env
+.env.*
+!.env.example
+.DS_Store
+*.swp
+.idea
+.vscode
+
+# docs + docker files are not needed to build the image
+# (DOCKER/ is still sent — the Dockerfile and nginx.conf are read by
+# the build itself — but the compose file and README are not).
+DOCKER/docker-compose.yml
+DOCKER/README.md
+*.md
