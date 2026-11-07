@@ -192,33 +192,24 @@ describe("fastfs upload — the relative path", () => {
   // --- WHY --- the reference does
   //   relativePath = relativePath.replace(/^\//, "");
   //   const path = relativePath + file.name;
-  // (fastnear/fastdata-drag-and-drop, src/Upload/Upload.jsx) and it
-  // CONCATENATES with no separator.
-  //
-  // we saw the consequence on our first working mainnet upload: the
-  // relative path was "test.txt" and the file was "Hello.txt", and
-  // the served path came out as "test.txtHello.txt". the file served
-  // fine, but the url was a mess.
-  //
-  // so we INSERT a separator when the path does not already end with
-  // one. the path is the served path, so this is the difference
-  // between a usable url and a confusing one.
+  // (fastnear/fastdata-drag-and-drop, src/Upload/Upload.jsx) and its
+  // default relative path is "/", which becomes "" after the strip.
   test("one leading slash is stripped and the file name is appended", () => {
-    // the default relative path is "/", which becomes "" after the
-    // strip, so the path is just the file name.
+    // the reference's default relative path is "/", which becomes ""
+    // after the strip, so the path is just the file name.
     expect(build_relative_path("/", "small.txt")).toBe("small.txt");
     expect(build_relative_path("", "small.txt")).toBe("small.txt");
-    // a separator is inserted when the path does not end with one.
-    expect(build_relative_path("notes", "small.txt")).toBe("notes/small.txt");
-    // and not doubled when it does.
+    // the reference CONCATENATES, it does not insert a separator, so
+    // the user has to type the trailing slash themselves.
+    expect(build_relative_path("notes", "small.txt")).toBe("notessmall.txt");
     expect(build_relative_path("notes/", "small.txt")).toBe("notes/small.txt");
   });
 
   // --- WHY --- the regex strips exactly ONE slash, so "//notes" keeps
-  // its second slash — which then becomes a leading slash on the
-  // served path.
+  // its second slash. we mirror the reference exactly, because the
+  // path is the served path.
   test("only ONE leading slash is stripped, like the reference", () => {
-    expect(build_relative_path("//notes", "small.txt")).toBe("/notes/small.txt");
+    expect(build_relative_path("//notes", "small.txt")).toBe("/notessmall.txt");
   });
 
   // --- WHY --- the path is part of the url, so it must not start with

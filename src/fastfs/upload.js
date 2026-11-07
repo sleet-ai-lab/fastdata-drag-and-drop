@@ -144,38 +144,26 @@ export const QUOTE_BYTE = 0x22;
 // WHY: this is the path the file is served under, and it is part of
 // the url, so it is worth letting the user edit it.
 //
-// the reference implementation
-// (fastnear/fastdata-drag-and-drop, src/Upload/Upload.jsx) does this:
+// the rule mirrors the reference implementation
+// (fastnear/fastdata-drag-and-drop, src/Upload/Upload.jsx):
 //
 //   relativePath = relativePath.replace(/^\//, "");   // strip ONE leading slash
 //   const path = relativePath + file.name;
 //
-// and it CONCATENATES with no separator, so "notes" + "a.txt" is
-// "notesa.txt" — the user has to type the trailing slash themselves.
+// the reference's default relative path is "/", which becomes ""
+// after the strip, so the path is just the file name.
 //
-// we saw the consequence on our first working upload: the relative
-// path was "test.txt" and the file was "Hello.txt", and the served
-// path came out as "test.txtHello.txt". the file was served fine, but
-// the url was a mess.
+// NOTE the regex strips exactly ONE leading slash, so "//notes" keeps
+// its second slash (and becomes "/notes" + the file name).
 //
-// so we INSERT a separator when the path does not already end with
-// one:
-//
-//   ""            + "a.txt"  ->  "a.txt"
-//   "notes"       + "a.txt"  ->  "notes/a.txt"
-//   "notes/"      + "a.txt"  ->  "notes/a.txt"
-//   "/notes"      + "a.txt"  ->  "notes/a.txt"
-//
-// the path is the served path, so this is the difference between a
-// usable url and a confusing one.
-//
-// the leading slash is still stripped — one of them — because the
-// path is appended to a url that already has one.
+// NOTE there is NO separator inserted: the reference CONCATENATES the
+// relative path and the file name directly, so "notes" + "a.txt" is
+// "notesa.txt". the user has to type the trailing slash themselves.
+// we mirror the reference exactly, because the path is the served
+// path and a different path means a different url.
 export function build_relative_path(relative_path, file_name) {
   const base = (relative_path ?? "").replace(/^\//, "");
-  const name = file_name ?? "";
-  if (base === "") return name;
-  return base.endsWith("/") ? base + name : `${base}/${name}`;
+  return base + (file_name ?? "");
 }
 // ========================================
 

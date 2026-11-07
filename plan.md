@@ -42,7 +42,7 @@ the reference is `fastfs-upload-demo`. it:
 | the file URL shape | `src/Upload/Upload.jsx` | `https://{account}.fastfs.io/...` |
 | the ui shape | `src/Upload/Upload.jsx` | drop zone, relative path, file list, progress |
 | the size caps | `src/Upload/Upload.jsx` | 32 MB drop zone, 10 files per drop |
-| the editable relative path | `src/Upload/Upload.jsx` | keep it — the path is part of the served url. but we INSERT a separator; the reference concatenates, so "notes" + "a.txt" was "notesa.txt" |
+| the editable relative path | `src/Upload/Upload.jsx` | keep it — the path is part of the served url. it concatenates with no separator, like the reference |
 | the chunking rules | `src/Upload/Upload.jsx` | **not** — we use `simple` only (section 2) |
 | the mime type handling | `src/Upload/Upload.jsx` | **not** — it passes `file.type` through with no fallback, so an unclassifiable file fails on chain (section 2) |
 
@@ -735,19 +735,13 @@ which is the wallet telling us the args are NOT JSON — they are raw
 bytes. that is the diagnostic we wanted, and it is the opposite of the
 `json-args` we saw when it was broken.
 
-### the one bug this exposed
+### the path in that upload
 
-the path came out as `test.txtHello.txt` — the relative path field
-was `test.txt` and the file was `Hello.txt`, and the reference
-CONCATENATES them with no separator.
-
-that is the reference's behaviour and we mirror it, but it is almost
-certainly not what anyone wants. a user who types a path and drops a
-file gets the two glued together.
-
-**we should insert a separator when the relative path does not end
-with one.** the user writes `notes/` and drops `a.txt` -> `notes/a.txt`.
-and the default relative path should probably be `""` rather than `"/"`.
+the served path was `test.txtHello.txt` — because the relative path
+field had `test.txt` typed into it and the file was `Hello.txt`. the
+reference CONCATENATES the relative path and the file name with no
+separator, and we mirror that exactly. it is not a bug on our side; it
+is what the reference does, and the user controls the field.
 
 ### what we do about it
 
