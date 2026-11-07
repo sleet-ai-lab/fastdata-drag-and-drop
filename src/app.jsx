@@ -45,6 +45,8 @@ export function App() {
   );
   const [network, set_network] = use_state(FASTDATA_NETWORK.get_network());
   const [files, set_files] = use_state([]);
+  // the default relative path. "/" becomes "" after the leading slash
+  // is stripped, so the file is served under its own name.
   const [relative_path, set_relative_path] = use_state("/");
   const [uploading, set_uploading] = use_state(false);
   const [results, set_results] = use_state([]);

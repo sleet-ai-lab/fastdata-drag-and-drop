@@ -139,8 +139,9 @@ export function RelativePathField({ value, on_change, disabled }) {
           https://&#123;account&#125;.fastfs.io/&#123;namespace&#125;/
           &#123;relative-path&#125;
         </code>
-        . the path and the file name are joined with no separator, so end
-        it with a slash.
+        . a folder path is joined to the file name with a slash, so
+        &ldquo;notes&rdquo; serves the file as{" "}
+        <code>notes/your-file.txt</code>.
       </p>
     </div>
   );

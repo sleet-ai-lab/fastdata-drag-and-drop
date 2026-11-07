@@ -42,7 +42,7 @@ the reference is `fastfs-upload-demo`. it:
 | the file URL shape | `src/Upload/Upload.jsx` | `https://{account}.fastfs.io/...` |
 | the ui shape | `src/Upload/Upload.jsx` | drop zone, relative path, file list, progress |
 | the size caps | `src/Upload/Upload.jsx` | 32 MB drop zone, 10 files per drop |
-| the editable relative path | `src/Upload/Upload.jsx` | keep it — the path is part of the served url |
+| the editable relative path | `src/Upload/Upload.jsx` | keep it — the path is part of the served url. but we INSERT a separator; the reference concatenates, so "notes" + "a.txt" was "notesa.txt" |
 | the chunking rules | `src/Upload/Upload.jsx` | **not** — we use `simple` only (section 2) |
 | the mime type handling | `src/Upload/Upload.jsx` | **not** — it passes `file.type` through with no fallback, so an unclassifiable file fails on chain (section 2) |
 
@@ -686,6 +686,68 @@ we cannot be sure from the outside that it accepts a dapp-supplied
 native action. the app's on-chain check will tell us: if the args come
 back as our bytes, it worked; if they come back as JSON text, it did
 not, and the app reports the upload as failed.
+
+### IT WORKS — confirmed on mainnet
+
+the executor route works. the real wallet received the native action,
+the base64 args were decoded, and the raw borsh bytes went on chain.
+
+the mainnet transaction `5GMKqNsx8Hg2HPnrHxiuF9H3nSkhnSS5jjATjGbqLdZN`:
+
+```
+signer:   sleet.near  ->  receiver: fastfs.near
+method:   __fastdata_fastfs   gas: 1   deposit: 0
+
+on-chain args: 46 bytes
+  00 11 00 00 00 746573742e747874 48656c6c6f2e747874 01 0a 00 00 00
+  746578742f706c61696e 05 00 00 00 68656c6c6f
+  ^0   ^len 17    ^path           ^opt ^len 10   ^mime       ^len 5 ^body
+
+first byte: 0x00        the `simple` enum discriminant
+relativePath: 'test.txtHello.txt'
+mimeType:     'text/plain'
+content:      'hello'
+consumed all 46 bytes: true
+```
+
+and the file is served:
+
+```
+$ curl -i https://sleet.near.fastfs.io/fastfs.near/test.txtHello.txt
+HTTP/2 200
+content-type: text/plain
+content-length: 5
+x-fastdata-tx-hash: 5GMKqNsx8Hg2HPnrHxiuF9H3nSkhnSS5jjATjGbqLdZN
+x-fastdata-block-height: 223399962
+
+hello
+```
+
+the wallet's approve screen showed it as **binary**, with the CLI
+command in `base64-args` form:
+
+```
+binary:
+000900000048656c6c6f2e747874010a000000746578742f706c61696e0500000068656c6c6f
+```
+
+which is the wallet telling us the args are NOT JSON — they are raw
+bytes. that is the diagnostic we wanted, and it is the opposite of the
+`json-args` we saw when it was broken.
+
+### the one bug this exposed
+
+the path came out as `test.txtHello.txt` — the relative path field
+was `test.txt` and the file was `Hello.txt`, and the reference
+CONCATENATES them with no separator.
+
+that is the reference's behaviour and we mirror it, but it is almost
+certainly not what anyone wants. a user who types a path and drops a
+file gets the two glued together.
+
+**we should insert a separator when the relative path does not end
+with one.** the user writes `notes/` and drops `a.txt` -> `notes/a.txt`.
+and the default relative path should probably be `""` rather than `"/"`.
 
 ### what we do about it
 
