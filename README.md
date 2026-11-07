@@ -3,8 +3,6 @@
 a preact web app, built with vite. deployed as a static site behind a
 cloudflare tunnel.
 
-live at https://fastdata-drag-and-drop.shit-1170.com/
-
 ## develop
 
 ```sh

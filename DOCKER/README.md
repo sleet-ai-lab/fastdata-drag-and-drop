@@ -46,7 +46,15 @@ change:
 bun run deploy
 ```
 
-then check https://fastdata-drag-and-drop.shit-1170.com/
+the deploy script checks the live site against the local build only when
+`FASTDATA_SITE_URL` is set:
+
+```sh
+FASTDATA_SITE_URL="https://your-site.example/" bun run deploy
+```
+
+with the variable unset, the script skips the live bundle check and
+reports the local build hash instead.
 
 ## the tunnel token
 

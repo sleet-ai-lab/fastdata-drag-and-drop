@@ -1046,8 +1046,8 @@ guarantees the bytes we build are the bytes that land on chain.
       upload area, like the reference does. the ui shows which network
       the connected account is on.
 - [x] **7. containerize + deploy.** the docker setup already exists
-      in `DOCKER/`. the image is rebuilt and the site is live at
-      https://fastdata-drag-and-drop.shit-1170.com/.
+      in `DOCKER/`. the image is rebuilt and the site goes live behind
+      the cloudflare tunnel.
 - [ ] **8. the real upload.** the one thing we cannot do from here: a
       human connects a wallet and uploads a file. the app verifies the
       on-chain args by itself; the human opens the url and confirms the

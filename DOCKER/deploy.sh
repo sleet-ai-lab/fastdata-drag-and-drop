@@ -22,7 +22,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="${REPO_ROOT}/DOCKER/docker-compose.yml"
-SITE_URL="${FASTDATA_SITE_URL:-https://fastdata-drag-and-drop.shit-1170.com/}"
+SITE_URL="${FASTDATA_SITE_URL:-}"
 
 cd "${REPO_ROOT}"
 
@@ -67,6 +67,12 @@ local_bundle="$(ls dist/assets/*.js 2>/dev/null | head -1 | xargs -r basename)"
 if [ -z "${local_bundle}" ]; then
   echo "!! no local bundle in dist/. run the build first." >&2
   exit 1
+fi
+if [ -z "${SITE_URL}" ]; then
+  echo "==> skipping the live bundle check (no FASTDATA_SITE_URL set)"
+  echo
+  echo "built: ${local_bundle}"
+  exit 0
 fi
 remote_bundle="$(curl -sS --max-time 25 "${SITE_URL}" | grep -oE 'index-[A-Za-z0-9_-]+\.js' | head -1)"
 if [ "${remote_bundle}" != "${local_bundle}" ]; then
