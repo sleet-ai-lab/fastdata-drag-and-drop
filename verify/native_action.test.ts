@@ -85,6 +85,18 @@ function make_connector() {
   connector.wallet = async () => ({
     manifest: { features: {} },
     getAccounts: async () => [{ accountId: "sleet.near" }],
+    // the real wallet's `executor` is a PUBLIC field and is what
+    // carries the action to the wallet iframe without near-connect's
+    // conversion. that is the route we use.
+    executor: {
+      call: async (method: string, params: unknown) => {
+        captured.value = { method, ...(params as object) };
+        return {
+          final_execution_status: "EXECUTED_OPTIMISTIC",
+          transaction: { hash: "HASH", signer_id: "sleet.near" },
+        };
+      },
+    },
     signAndSendTransaction: async (params: unknown) => {
       captured.value = params;
       return {
@@ -106,6 +118,9 @@ describe("the native action shape", () => {
 
     await send_native_function_call("fastfs.near", bytes, { connector });
 
+    // the executor route was used, not signAndSendTransaction.
+    expect(captured.value.method).toBe("wallet:signAndSendTransaction");
+
     const action = captured.value.actions[0];
 
     // --- THE NATIVE SHAPE ---
@@ -115,12 +130,11 @@ describe("the native action shape", () => {
     expect(action.FunctionCall.gas).toBe(GAS);
     expect(action.FunctionCall.deposit).toBe("0");
 
-    // the `type` key is ONLY there to get past near-connect's
-    // conversion, which passes any action with a "type" key through
-    // unchanged. it is not part of the native shape — the wallet's
-    // serde untagged deserializer matches Native(NearAction) on the
-    // "FunctionCall" key alone.
-    expect(action.type).toBe("FunctionCall");
+    // NO top-level "type" key. the wallet's native variant is an
+    // externally tagged enum, so a sibling "type" key makes serde look
+    // for a variant named "type" and fail with
+    // "unknown variant `type`, expected `FunctionCall`".
+    expect(action.type).toBeUndefined();
 
     // the args are base64, which the wallet decodes into raw bytes.
     expect(typeof action.FunctionCall.args).toBe("string");
@@ -129,8 +143,8 @@ describe("the native action shape", () => {
     expect(decoded[0]).toBe(0x00);
   });
 
-  // --- WHY --- this is the bypass that makes the native shape
-  // reachable at all. near-connect's conversion is:
+  // --- WHY --- near-connect's conversion cannot pass a native action
+  // through, which is why we use the wallet's executor instead.
   //
   //   const nearActionsToConnectorActions = (actions) => actions.map((action) => {
   //     if ("type" in action) return action;      // passthrough
@@ -138,15 +152,22 @@ describe("the native action shape", () => {
   //     throw new Error("Unsupported action type");
   //   });
   //
-  // a pure native action has no "type" key, so it would hit the
-  // throw. the "type" key makes it pass through untouched.
-  test("near-connect's conversion passes the native action through", async () => {
+  // a native action has no "type" key, so it hits the throw. adding
+  // one gets it past the conversion, but the wallet's externally
+  // tagged native variant then rejects it. we verified that by
+  // compiling the wallet's exact serde types:
+  //
+  //   native, no type key   -> OK Native, raw bytes, first 0x00
+  //   native WITH type key  -> ERR unknown variant `type`
+  //
+  // so the executor is the way through: it posts the params to the
+  // wallet iframe with no conversion at all.
+  test("near-connect's conversion rejects a native action", async () => {
     const { nearActionsToConnectorActions } = await import(
       "@hot-labs/near-connect/build/actions/index.js"
     );
 
     const native = {
-      type: "FunctionCall",
       FunctionCall: {
         method_name: METHOD_NAME,
         args: "ABEAAA==",
@@ -155,61 +176,9 @@ describe("the native action shape", () => {
       },
     };
 
-    // it comes back UNCHANGED.
-    const out = nearActionsToConnectorActions([native]);
-    expect(out[0]).toBe(native);
-    expect(out[0].FunctionCall.args).toBe("ABEAAA==");
-
-    // and WITHOUT the "type" key it would have thrown.
-    const { type: _type, ...without_type } = native;
-    expect(() => nearActionsToConnectorActions([without_type])).toThrow(
+    expect(() => nearActionsToConnectorActions([native])).toThrow(
       "Unsupported action type",
     );
-  });
-
-  test("what lands on chain is the raw borsh, not a quoted string", async () => {
-    const { connector, captured } = make_connector();
-    const bytes = build_payload();
-
-    await send_native_function_call("fastfs.near", bytes, { connector });
-
-    // this is the wallet's own step: the native action's args are
-    // base64, so the wallet decodes them and those bytes go on chain.
-    const on_chain = base64_to_bytes(
-      captured.value.actions[0].FunctionCall.args,
-    );
-
-    // --- the shape that WORKS ---
-    expect(on_chain.length).toBe(bytes.length);
-    expect(on_chain[0]).toBe(0x00);
-    expect(on_chain[0]).not.toBe(0x22);
-
-    // --- the shape that FAILED ---
-    // the wallet-selector path JSON-wraps the string, and the quotes
-    // become bytes 0 and n-1.
-    const failed = new TextEncoder().encode(
-      JSON.stringify(bytes_to_base64(bytes)),
-    );
-    expect(failed[0]).toBe(0x22);
-    expect(failed.length).toBe(bytes_to_base64(bytes).length + 2);
-
-    // and the indexer's borsh::from_slice fails on that one. we can
-    // check the borsh side directly: the raw bytes parse, the quoted
-    // ones do not.
-    expect(() =>
-      borshSerialize(FastfsSchema.FastfsData, {
-        simple: {
-          relativePath: PATH,
-          content: { mimeType: MIME, content: CONTENT },
-        },
-      }),
-    ).not.toThrow();
-
-    // the quoted shape is not valid borsh for our schema — it is a
-    // JSON string where the schema wants an enum. so the indexer's
-    // borsh::from_slice would return Err and drop the action.
-    const as_json = JSON.parse(new TextDecoder().decode(failed));
-    expect(typeof as_json).toBe("string");
   });
 
   test("the receiver, signer and gas all go through unchanged", async () => {

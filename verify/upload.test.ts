@@ -497,13 +497,54 @@ function make_sending_near(mangle = false) {
   // the connector holds the wallet. signAndSendTransaction lives on
   // the WALLET, not the connector, so the fake models that.
   const connector = {
+    network: "testnet",
     async wallet() {
       return {
+        // the real wallet's `executor` is a PUBLIC field, and it is
+        // what carries the action to the wallet iframe WITHOUT
+        // near-connect's conversion. that is the route we use, because
+        // the conversion cannot pass a native action through: it needs
+        // a top-level "type" key, and the wallet's externally tagged
+        // native variant rejects one ("unknown variant `type`").
+        executor: {
+          async call(
+            method: string,
+            params: {
+              signerId?: string;
+              receiverId: string;
+              actions: Array<{
+                FunctionCall: {
+                  method_name: string;
+                  args: string;
+                  gas: string;
+                  deposit: string;
+                };
+              }>;
+            },
+          ) {
+            const action = params.actions[0].FunctionCall;
+            sent.push({
+              method,
+              receiver_id: params.receiverId,
+              method_name: action.method_name,
+              args: action.args,
+              gas: action.gas,
+              deposit: action.deposit,
+            });
+            return {
+              transaction: {
+                hash: "FAKEHASH",
+                signer_id: params.signerId ?? "mob.near",
+                receiver_id: params.receiverId,
+              },
+            };
+          },
+        },
+        // the fallback path, for a wallet with no executor.
         async signAndSendTransaction(params: {
           signerId?: string;
           receiverId: string;
           actions: Array<{
-            type: string;
             FunctionCall: {
               method_name: string;
               args: string;
@@ -512,8 +553,9 @@ function make_sending_near(mangle = false) {
             };
           }>;
         }) {
-      const action = params.actions[0].FunctionCall;
+          const action = params.actions[0].FunctionCall;
           sent.push({
+            method: "wallet:signAndSendTransaction",
             receiver_id: params.receiverId,
             method_name: action.method_name,
             args: action.args,

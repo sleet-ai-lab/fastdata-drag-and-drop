@@ -65,15 +65,32 @@
 //   if (action.functionCall) { ...convert... }
 //   throw new Error("Unsupported action type");
 //
-// so we add a "type" key. that makes near-connect pass the action
-// through UNCHANGED, and it is harmless on the wallet side: the
-// wallet's serde is untagged, Native(NearAction) comes first, and it
-// parses as soon as the json has a "FunctionCall" key.
+// --- WAIT: the "type" key does NOT work, and we proved it ---
+//
+// the plan was to add a "type" key so near-connect would pass the
+// action through UNCHANGED. but the wallet's native variant is an
+// EXTERNALLY TAGGED enum, so a sibling "type" key makes serde look for
+// a variant named "type":
+//
+//   unknown variant `type`, expected `FunctionCall`
+//
+// we compiled the wallet's exact serde types and ran them:
+//
+//   native, no type key            -> OK Native, raw bytes, first 0x00
+//   native WITH type key           -> ERR unknown variant `type`
+//   wallet-selector, args a string -> OK, but the args become JSON text
+//   wallet-selector, args an array -> OK, but the args become JSON text
+//
+// so the native action needs NO top-level "type", and near-connect
+// REQUIRES one to pass through. contradictory.
+//
+// the way out is the wallet's `executor`, which is a public field and
+// posts its params straight to the wallet iframe with no conversion.
+// see send_native_function_call.
 //
 // --- what we send ---
 //
-//   { "type": "FunctionCall",
-//     "FunctionCall": { "method_name": "__fastdata_fastfs",
+//   { "FunctionCall": { "method_name": "__fastdata_fastfs",
 //                       "args": "<base64 of the borsh bytes>",
 //                       "gas": "1", "deposit": "0" } }
 //
@@ -525,8 +542,15 @@ export async function send_native_function_call(receiver_id, bytes, options = {}
   //
   // would otherwise have done `serde_json::to_vec(&args)` — which is
   // what quoted our args and made the upload 404.
+  //
+  // NOTE: NO top-level "type" key. the wallet's Native variant is an
+  // externally tagged enum, so a sibling "type" key makes serde look
+  // for a variant named "type" and fail:
+  //
+  //   unknown variant `type`, expected `FunctionCall`
+  //
+  // we verified this by compiling the wallet's exact serde types.
   const action = {
-    type: "FunctionCall",
     FunctionCall: {
       method_name: METHOD_NAME,
       args: bytes_to_base64(bytes),
@@ -549,11 +573,48 @@ export async function send_native_function_call(receiver_id, bytes, options = {}
 
   const wallet = await connector.wallet();
 
-  return await wallet.signAndSendTransaction({
+  const params = {
     ...(signer_id !== null ? { signerId: signer_id } : {}),
     receiverId: receiver_id,
     actions: [action],
-  });
+  };
+
+  // --- THE EXECUTOR ROUTE ---
+  //
+  // near-connect's `wallet.signAndSendTransaction` runs the action
+  // through `nearActionsToConnectorActions`, which CANNOT pass a
+  // native action through:
+  //
+  //   if ("type" in action) return action;   // needs a top-level "type"
+  //   if (action.functionCall) { ...convert to the wallet-selector shape... }
+  //   throw new Error("Unsupported action type");
+  //
+  // and the wallet's native variant REJECTS a top-level "type". the
+  // two requirements are contradictory, so the native path is
+  // unreachable through that method.
+  //
+  // but the wallet's `executor` is a PUBLIC field, and the executor
+  // posts its params straight to the wallet iframe as JSON:
+  //
+  //   async call(method, params) {
+  //     ...
+  //     iframe.postMessage({ method, params, id });
+  //   }
+  //
+  // so calling the executor directly skips the conversion, and the
+  // native action reaches the wallet untouched. that is the only way
+  // the raw bytes can land on chain.
+  //
+  // we use it when the wallet exposes an executor, and fall back to
+  // the normal path otherwise.
+  if (wallet.executor && typeof wallet.executor.call === "function") {
+    return await wallet.executor.call("wallet:signAndSendTransaction", {
+      ...params,
+      network: connector.network,
+    });
+  }
+
+  return await wallet.signAndSendTransaction(params);
 }
 // ========================================
 // ========================================

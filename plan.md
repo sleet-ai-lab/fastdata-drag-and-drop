@@ -484,18 +484,26 @@ this is the core of the app. a file upload is a NEAR transaction whose
 args must be **raw borsh bytes** on chain, so the indexer can
 borsh-decode them.
 
-**this took three attempts to get right, and each wrong attempt
-looked plausible.** the errors were:
+**this took four attempts, and each wrong attempt looked plausible.**
+we now have the answer verified against the wallet's own Rust
+deserializer, compiled and run locally.
 
-1. sending the raw `Uint8Array` — near-connect's `JSON.stringify`
-   flattened it into `{"0":0,"1":9,...}`, and the wallet had to guess
-   those numbers were bytes
-2. sending a base64 string — the wallet's wallet-selector path
-   JSON-wrapped it into `"ABEAAA..."`, and those quotes became bytes
-   on chain (our tx `4s6v2whoeMhkHtwHDBVsp8EqYAVENoVgq4yxbdXJnuDj`,
-   66 bytes starting with `0x22`, never picked up)
-3. **sending a NATIVE action** — the args are base64 in json, and the
-   wallet decodes them into raw bytes on chain. this is the one.
+### what the indexer needs
+
+the indexer is open source (`fastnear/fastdata-indexer`):
+
+```rust
+// main-indexer/src/main.rs
+data: args.to_vec(),          // the raw bytes, verbatim
+
+// fastfs-sub-indexer/src/main.rs
+if let Ok(value) = borsh::from_slice(&fastdata.data) { ... }
+```
+
+`borsh::from_slice` on anything that is not valid borsh FAILS, the
+`if let Ok` is false, and the action is **dropped without a trace**.
+the transaction still succeeds, the file never appears, and the url
+404s.
 
 ### the wallet has two paths, and only one can carry bytes
 
@@ -505,40 +513,51 @@ from the wallet's own source (`INTEARnear/wallet`, `web/src/utils.rs`):
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub enum SendTransactionsAction {
-    Native(NearAction),
+    Native(NearAction),              // tried FIRST
     WalletSelector(WalletSelectorAction),
 }
 ```
 
-the **native** one is tried first. its args (`near-min-api/src/types.rs`):
+**the native path** (`near-min-api/src/types.rs`):
 
 ```rust
 pub struct FunctionCallAction {
     pub method_name: String,
     #[serde_as(as = "Base64")]
-    pub args: Vec<u8>,      // base64 in json -> RAW BYTES on chain
+    pub args: Vec<u8>,       // base64 in json -> RAW BYTES on chain
     pub gas: Gas,
     pub deposit: NearToken,
 }
 ```
 
-the **wallet-selector** one — what near-kit's adapter produces — has
-`args: serde_json::Value` and converts with:
+**the wallet-selector path** — what near-kit's adapter produces:
 
 ```rust
+FunctionCall {
+    method_name: String,
+    args: serde_json::Value,          // a JSON VALUE
+    ...
+}
+// and the conversion:
 args: serde_json::to_vec(&args).unwrap_or_default(),
 ```
 
-so the args are a JSON VALUE, serialized as JSON. a string comes out
-**quoted**, and the quotes are bytes on chain. borsh fails, the
-indexer drops the action, the file 404s.
+`serde_json::to_vec` of a `Value` **always** produces JSON text. so
+whatever shape the args take, the on-chain args are JSON text:
+
+| the args value | on-chain args | first byte | borsh |
+| --- | --- | --- | --- |
+| a base64 string | `"ABEAAA..."` | `0x22` | fails |
+| a byte-indexed object | `{"0":0,"1":9,...}` | `0x7b` | fails |
+| a byte array | `[0,9,0,...]` | `0x5b` | fails |
+| **raw bytes (native path)** | **the bytes themselves** | **`0x00`** | **parses** |
 
 **the wallet-selector path cannot carry raw bytes. only the native
 path can.**
 
-### reaching the native path
+### reaching the native path — and why it is blocked
 
-near-connect's own conversion would throw on a native action:
+near-connect's conversion is the gate:
 
 ```js
 const nearActionsToConnectorActions = (actions) => actions.map((action) => {
@@ -548,108 +567,157 @@ const nearActionsToConnectorActions = (actions) => actions.map((action) => {
 });
 ```
 
-so we add a `type` key. near-connect then passes the action through
-**unchanged**, and it is harmless on the wallet side: serde is
-untagged, `Native(NearAction)` comes first, and it parses as soon as
-the json has a `FunctionCall` key.
+so an action with a top-level `type` passes through **unchanged**. but
+the wallet's native variant is an **externally tagged** enum, so it
+must be exactly `{"FunctionCall": {...}}` — and a sibling `type` key
+makes serde look for a variant named `type`:
 
-### what we send
+```
+unknown variant `type`, expected `FunctionCall`
+```
+
+we verified this by compiling the wallet's exact serde types and
+running them. the results:
+
+```
+native, no type key            -> OK Native, 46 raw bytes, first 0x00
+native WITH type key           -> ERR unknown variant `type`
+native, extra field INSIDE     -> OK Native, 46 raw bytes, first 0x00
+wallet-selector, args a string -> OK WalletSelector (args become JSON text)
+wallet-selector, args an array -> OK WalletSelector (args become JSON text)
+```
+
+so the native action needs **no top-level `type`** — and near-connect
+**requires** one to pass through. the two requirements are
+contradictory.
+
+**and the conversion is inside `wallet.signAndSendTransaction`**, so
+calling the wallet directly does not skip it:
 
 ```js
-{
-  type: "FunctionCall",     // only to get past near-connect's conversion
-  FunctionCall: {
-    method_name: "__fastdata_fastfs",
-    args: "<base64 of the borsh bytes>",
-    gas: "1",
-    deposit: "0",
-  },
+// @hot-labs/near-connect, SandboxedWallet/index.js
+async signAndSendTransaction(params) {
+  const actions = nearActionsToConnectorActions(params.actions);   // <-- here
+  ...
 }
 ```
 
-the wallet decodes the base64 into our exact bytes, and those go on
-chain verbatim. the indexer's `borsh::from_slice` parses them and the
-file lands.
+### so the native path is unreachable from a browser dapp on this stack
 
-**this is also how the working reference transaction landed 121512 raw
-bytes on chain** (`mob.near` -> `fastfs.near`). it went through the
-native path too.
+with `@hot-labs/near-connect` + the Intear wallet, the args on chain
+are **always** JSON text. that means `borsh::from_slice` always fails
+and the FastFS indexer always drops the action.
 
-### what actually lands on chain
+**this is not something we can fix in our app.** it is a gap between
+near-connect's action conversion and the FastFS format, which needs
+raw bytes.
 
-```
-our bytes:      00 09 00 00 00 "Hello.txt" 01 0a 00 00 00 "text/plain" 05 00 00 00 "hello"
-on chain:       the SAME 38 bytes
-first byte:     0x00  <- the borsh enum discriminant
-```
+### the one way through: the wallet's executor
 
-and the two shapes that failed:
-
-```
-wallet-selector path:  22 41 42 45 ... 22   66 bytes, 0x22 = a quote
-the reference's failed: 22 41 41 38 ... 22   74 bytes, 0x22 = a quote
-```
-
-both start with `0x22`, and borsh cannot parse a quote.
-
-### the verification
-
-`verify/native_action.test.ts` pins the shape, and
-`verify/wallet_path.test.ts` drives the real near-kit and near-connect.
-
-the check we can do without a wallet: the on-chain args must start
-with `0x00` and be byte-for-byte our bytes. the app does that itself
-after every upload — it pulls the transaction back and compares. that
-is the check that catches this class of bug, and it is the reason the
-mangled case in the tests is worth having.
-
-### the signer is picked by the wallet
-
-we do **not** pass `signerId`. near-kit resolves it from the connected
-wallet's first account, and so does the wallet. the account that
-signed is the account in the resulting url — `predecessor_id` in
-`https://{predecessor_id}.fastfs.io/...`.
-
-### how the result comes back, and what "success" means
-
-the wallet returns a `FinalExecutionOutcome` with the tx hash. the
-app then pulls the transaction back with
-`near.getTransactionStatus(hash, signer_id, "EXECUTED_OPTIMISTIC")`
-and compares the on-chain args to our bytes.
-
-**two things about that call:**
-
-- the wait level must be `EXECUTED_OPTIMISTIC`, not `INCLUDED`. at
-  `INCLUDED` near-kit parses through `MinimalTransactionSchema` and
-  zod strips the undeclared `actions` key, so the transaction comes
-  back with no actions at all and the check could never work. we
-  verified this against the real schema.
-- the receipt's `status` is `false` on working uploads too, so it is
-  **not** the success signal. the args comparison is.
-
-### the reference does NOT verify anything
-
-for the record, the reference implementation:
+near-connect's conversion is inside `wallet.signAndSendTransaction`,
+so calling the wallet does not skip it. BUT the wallet's `executor` is
+a **public field**, and the executor posts its params straight to the
+wallet iframe as JSON:
 
 ```js
-await callFunction({ ... })
-  .catch(() => {})                       // swallows every error
-  .finally(() => {
-    file.uploadedParts += 1;
-    if (file.uploadedParts === file.numParts) {
-      file.uploads = file.status = Status.Success;   // "success"
-      file.url = `https://${accountId}.fastfs.io/...`;  // url is guessed
-    }
-  });
+// @hot-labs/near-connect, SandboxedWallet/executor.js
+async call(method, params) {
+  ...
+  iframe.postMessage({ method, params, id });
+}
 ```
 
-it marks the file **Success** as soon as the promise settles, builds
-the url from the account and the path, and never checks that the file
-is served. a transaction the indexer silently dropped looks exactly
-like a successful upload.
+so `wallet.executor.call("wallet:signAndSendTransaction", {...})` with
+a NATIVE action would reach the wallet without the conversion.
 
-we do one extra check, because it catches the exact failure we spent
-a day on.
+**we have NOT verified this works** — the wallet's message handler for
+that method name is inside the wasm, and the Intear wallet's
+`send-transactions` flow signs a payload the wallet builds itself, not
+one the dapp supplies. so this needs a real wallet to test.
+
+### how the working reference transaction did it
+
+the `mob.near` -> `fastfs.near` transaction landed **121512 raw bytes**
+on chain. so whatever sent it used the native path — which means it
+did NOT go through near-connect's conversion. it was almost certainly
+sent by a CLI or a tool that builds the action natively.
+
+the wallet's own approve screen even tells you the difference. it
+prints the CLI command it would run, and picks the mode by trying to
+parse the args as JSON:
+
+```rust
+if let Ok(value) = serde_json::from_slice::<serde_json::Value>(args) {
+    ("json-args", serde_json::to_string(&value))
+} else {
+    ("base64-args", BASE64_STANDARD.encode(args))
+}
+```
+
+so a wallet that received RAW BYTES shows `base64-args` — the mode
+that puts the bytes on chain. one that received JSON text shows
+`json-args`.
+
+**the wallet screen is the diagnostic.** if it says `json-args`, the
+args are JSON text and the upload will 404.
+
+### the fix we shipped: the wallet's executor
+
+near-connect's conversion is inside `wallet.signAndSendTransaction`,
+so calling the wallet does not skip it. BUT the wallet's `executor` is
+a **public field**, and the executor posts its params straight to the
+wallet iframe as JSON:
+
+```js
+// @hot-labs/near-connect, SandboxedWallet/executor.js
+async call(method, params) {
+  ...
+  iframe.postMessage({ method, params, id });
+}
+```
+
+so `wallet.executor.call("wallet:signAndSendTransaction", {...})` with
+a NATIVE action reaches the wallet without the conversion. that is
+what we do now.
+
+**this still needs a real wallet to confirm.** the wallet's
+`send-transactions` flow signs a payload the wallet builds itself, so
+we cannot be sure from the outside that it accepts a dapp-supplied
+native action. the app's on-chain check will tell us: if the args come
+back as our bytes, it worked; if they come back as JSON text, it did
+not, and the app reports the upload as failed.
+
+### what we do about it
+
+we have three options, and they are not equivalent:
+
+1. **keep the app, and let the user send the transaction with the
+   CLI.** the app builds the payload and shows the exact
+   `near contract call-function ... base64-args '<base64>'` command.
+   the wallet is not involved in sending at all, so the native path
+   is available. this WORKS today.
+
+2. **find a wallet that supports the native path.** the wallet's
+   protocol doc says the transactions string "also accepts the real
+   action syntax that is used in RPC communication" — so the WALLET
+   supports it. it is near-connect that cannot produce it. a wallet
+   with a native-capable connector would work.
+
+3. **patch or fork near-connect** so the conversion passes a native
+   action through. it is a small change — the conversion is one
+   function — but it means carrying a fork.
+
+we will do (1) as the immediate path and look at (2)/(3) properly.
+
+### the verification we can do without a wallet
+
+the app still verifies every upload by pulling the transaction back
+and comparing the on-chain args to our bytes. with the current stack
+that check will **fail** — and that is correct behaviour. it tells us
+the upload did not land, instead of showing a link that 404s.
+
+that check is what caught this. a "success" that was never verified
+would have shipped silently.
 
 ## 4. the network toggle — no page reload
 
