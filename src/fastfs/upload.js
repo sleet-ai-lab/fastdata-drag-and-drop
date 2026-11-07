@@ -1,14 +1,15 @@
 // ========================================
-// the upload path: file -> borsh bytes -> near.call -> on-chain check.
+// the upload path: file -> borsh bytes -> the wallet -> on-chain check.
 //
 // THIS IS THE MOST IMPORTANT MODULE IN THE APP. everything else is
 // ui. here is where a file either lands or silently does not, and the
 // difference between the two is a few bytes of encoding.
 //
-// THE ONE RULE: the args to near.call must be the BASE64 STRING of the
-// borsh bytes.
+// THE ONE RULE: the action must be a NATIVE FunctionCall action whose
+// args are the BASE64 of the borsh bytes.
 //
-// that reads wrong the first time, so here is the whole story.
+// it took three attempts to get that right, and each wrong attempt
+// looked plausible. so here is the whole story.
 //
 // --- what lands on chain ---
 // the indexer reads the action's args as raw bytes and borsh-decodes
@@ -23,87 +24,69 @@
 // borsh::from_slice on a JSON-WRAPPED base64 string FAILS, so the
 // `if let Ok(value)` is false and the indexer DROPS the action without
 // a trace. the transaction still succeeds, the file just never
-// appears, and the url 404s. we found a real mainnet transaction that
-// failed exactly this way (sleet.near -> fastfs.near, args = 74 bytes
-// of quoted base64).
+// appears, and the url 404s.
 //
-// --- how the args get to the wallet ---
-// near-connect sends the transaction to the wallet as JSON. in the
-// wallet's own source (the Intear wallet's near-selector.js):
+// --- the wallet has TWO paths, and only one can carry bytes ---
+// from the wallet's source (INTEARnear/wallet, web/src/utils.rs):
 //
-//   let l = t.map(w => ({ signerId, receiverId, actions: w.actions }));
-//   let y = JSON.stringify(l);
+//   #[derive(Deserialize)]
+//   #[serde(untagged)]
+//   pub enum SendTransactionsAction {
+//       Native(NearAction),
+//       WalletSelector(WalletSelectorAction),
+//   }
 //
-// and its B() helper only converts `params.code` to an array — it
-// never touches `params.args`.
+// the NATIVE one is tried FIRST. its args are
 //
-// so what the wallet ends up holding depends on what we send:
+//   pub struct FunctionCallAction {
+//       pub method_name: String,
+//       #[serde_as(as = "Base64")]
+//       pub args: Vec<u8>,     // base64 in json -> RAW BYTES on chain
+//       ...
+//   }
 //
-//   a Uint8Array   -> JSON.stringify makes it {"0":0,"1":9,...}. an
-//                     OBJECT keyed by byte index. the wallet shows it
-//                     as `json-args '{...}'` and there is nothing in it
-//                     saying "these numbers are the bytes".
+// the WALLET-SELECTOR one — which is what near-kit's adapter
+// produces — has `args: serde_json::Value` and converts with
 //
-//   a base64 string -> JSON.stringify leaves it a plain string. the
-//                     wallet's cli formatter has a `base64-args` mode
-//                     for exactly this, decodes it, and puts the BYTES
-//                     on chain.
+//   args: serde_json::to_vec(&args).unwrap_or_default(),
 //
-// the base64 string is unambiguous, so that is what we send.
+// so the args are a JSON VALUE, SERIALIZED AS JSON. a base64 string
+// value comes out QUOTED, and those quotes are bytes on chain. that is
+// what our tx 4s6v2whoeMhkHtwHDBVsp8EqYAVENoVgq4yxbdXJnuDj did — 66
+// bytes starting with 0x22 — and it was never picked up.
 //
-// --- this is what the reference does too ---
-// it base64s the borsh bytes and passes the base64 string:
+// so the wallet-selector path CANNOT carry raw bytes. only the native
+// path can.
 //
-//   const ffs64 = encodeFfs(part);
-//   await callFunction({ contractId, method: "__fastdata_fastfs", args: ffs64, gas: "1" });
+// --- reaching the native path ---
+// near-connect's own conversion would throw on a native action:
 //
-// and the reference WORKS. the sleet.near upload that failed was a
-// DIFFERENT wallet (wallet-selector), whose stringifyJsonOrBytes
-// JSON-WRAPPED the base64 string into `"AAkA..."` with quotes. a
-// different stringification, a different failure.
+//   if ("type" in action) return action;   // passthrough
+//   if (action.functionCall) { ...convert... }
+//   throw new Error("Unsupported action type");
 //
-// --- and near-kit does not get in the way ---
-// near-kit's TransactionBuilder.functionCall does
+// so we add a "type" key. that makes near-connect pass the action
+// through UNCHANGED, and it is harmless on the wallet side: the
+// wallet's serde is untagged, Native(NearAction) comes first, and it
+// parses as soon as the json has a "FunctionCall" key.
 //
-//   args instanceof Uint8Array ? args : TextEncoder().encode(JSON.stringify(args))
+// --- what we send ---
 //
-// (near-kit, core/transaction.js:204) — so a string becomes
-// JSON.stringify'd to `"AAkA..."` WITH QUOTES as bytes. and then
-// near-kit's wallet adapter tries to read those bytes back as JSON
-// (`wallets/adapters.js:26-35`):
+//   { "type": "FunctionCall",
+//     "FunctionCall": { "method_name": "__fastdata_fastfs",
+//                       "args": "<base64 of the borsh bytes>",
+//                       "gas": "1", "deposit": "0" } }
 //
-//   try { args = JSON.parse(new TextDecoder().decode(args)) } catch { /* keep */ }
+// the wallet decodes the base64 into our exact bytes, and those go on
+// chain verbatim. the indexer's borsh::from_slice parses them and the
+// file lands.
 //
-// that parse SUCCEEDS, because we deliberately made it valid JSON. so
-// the adapter hands the wallet back the plain base64 string, and the
-// wallet's base64-args mode decodes it to our exact bytes.
-//
-// every step of that is pinned by verify/wallet_path.test.ts, which
-// drives the real near-kit and the real near-connect.
-//
-// WHY WE IGNORE THE RECEIPT STATUS:
-// `outcomes.status` is FALSE on every fastfs upload — including the
-// working one (the mob.near transaction that produced a live, served
-// 121 KB png). the receiver has NO contract code, so there is no
-// successful method return to report. the status is false on the
-// working uploads AND on the failed ones, so it tells us nothing.
-// the signal is the args comparison. see plan.md section 6.
-//
-// WHY GAS IS "1":
-// a real working upload (mob.near -> fastfs.near) attached exactly 1
-// gas and used 7.49 TGas. the receiver has no contract, so no wasm
-// executes and the protocol refunds everything unused. the spec's
-// 300 TGas is a generous default for a real contract. near-kit's
-// 30 TGas default is also wrong here. see plan.md section 6.
-//
-// WHY WE DO NOT PASS signerId:
-// near.call resolves the signer itself — options.signerId, else the
-// default signer, else the connected wallet's first account. we want
-// the wallet's account to sign, so we pass nothing. see plan.md
-// section 3b.
+// this is also how the WORKING reference transaction landed 121512 raw
+// bytes on chain (mob.near -> fastfs.near). it went through the native
+// path too.
 // ========================================
 import { serialize as borshSerialize } from "borsh";
-import { near_kit_client } from "@near-kit-tool-box/web";
+import { near_kit_client, near_connect_client } from "@near-kit-tool-box/web";
 import { FastfsSchema } from "./schema.js";
 import { FASTDATA_NETWORK } from "../near/network.js";
 
@@ -216,7 +199,9 @@ export async function encode_file(file, relative_path) {
   const path = build_relative_path(relative_path, file?.name);
   const content = new Uint8Array(await file.arrayBuffer());
 
-  // this IS the Uint8Array. it goes straight into near.call.
+  // this IS the Uint8Array. it gets base64'd and sent as a native
+  // action — see the note at the top of this file for why the native
+  // shape is the one that lands the bytes on chain.
   const bytes = borshSerialize(FastfsSchema.FastfsData, {
     simple: {
       relativePath: path,
@@ -468,6 +453,112 @@ export async function verify_transaction(
 // ========================================
 
 // ========================================
+// send a function call as a NATIVE action, so the args land on chain
+// as raw bytes.
+//
+// WHY NOT near.call:
+// near-kit builds a wallet-selector style action and its adapter
+// converts it to `{ type: "FunctionCall", params: { ... } }`. the
+// wallet parses that path's args as a JSON VALUE and serializes them
+// as JSON, so a string comes out quoted and the bytes are lost.
+//
+// the native path takes the args as base64 in JSON and DECODES them
+// into raw bytes on chain. that is the path we need.
+//
+// HOW WE REACH IT:
+// near-connect's connector exposes signAndSendTransaction, and
+// near-kit's `fromNearConnect` adapter wraps it. we call the
+// connector directly with the native action shape, which the wallet
+// tries FIRST (its SendTransactionsAction enum is untagged, with
+// Native(NearAction) first).
+//
+// the shape, from the wallet's own types (INTEARnear/wallet,
+// near-min-api/src/types.rs):
+//
+//   pub struct FunctionCallAction {
+//       pub method_name: String,
+//       #[serde_as(as = "Base64")]
+//       pub args: Vec<u8>,
+//       pub gas: Gas,
+//       pub deposit: NearToken,
+//   }
+//
+//   and Action is an externally-tagged enum, so the json is:
+//
+//   { "FunctionCall": { "method_name": ..., "args": "<base64>", "gas": ..., "deposit": ... } }
+//
+// WHY THE GAS AND DEPOSIT ARE STRINGS:
+// the wallet's Gas and NearToken use `dec_format` in serde, so they
+// are decimal strings ("1", "0").
+export async function send_native_function_call(receiver_id, bytes, options = {}) {
+  const gas = options.gas ?? GAS;
+  const deposit = options.deposit ?? DEPOSIT;
+
+  // the native action. args are BASE64 — the wallet decodes them into
+  // the raw borsh bytes and those go on chain verbatim.
+  //
+  // the `type` key is there ONLY to get past near-connect's
+  // conversion, which does:
+  //
+  //   const nearActionsToConnectorActions = (actions) => actions.map((action) => {
+  //     if ("type" in action) return action;      // <-- passthrough
+  //     if (action.functionCall) { ...convert to the connector shape... }
+  //     ...
+  //     throw new Error("Unsupported action type");
+  //   });
+  //
+  // a pure native action has no "type" key, so it would hit the
+  // "Unsupported action type" throw. adding "type" makes it pass
+  // through UNCHANGED.
+  //
+  // and that is safe on the wallet side: its action type is
+  //
+  //   #[serde(untagged)]
+  //   enum SendTransactionsAction { Native(NearAction), WalletSelector(...) }
+  //
+  // serde untagged tries the variants in order and takes the first
+  // that parses. Native(NearAction) parses as soon as the json has a
+  // "FunctionCall" key, and it comes FIRST. so the wallet takes the
+  // native path, where
+  //
+  //   impl From<WalletSelectorAction> for NearAction
+  //
+  // would otherwise have done `serde_json::to_vec(&args)` — which is
+  // what quoted our args and made the upload 404.
+  const action = {
+    type: "FunctionCall",
+    FunctionCall: {
+      method_name: METHOD_NAME,
+      args: bytes_to_base64(bytes),
+      gas: gas.toString(),
+      deposit: deposit.toString(),
+    },
+  };
+
+  // the connector holds the wallet. `signAndSendTransaction` lives on the
+  // WALLET, not the connector, so we go through connector.wallet().
+  //
+  // it is resolved lazily so a caller that supplies one never touches
+  // near_connect_client() (which reads localStorage).
+  const connector =
+    options.connector !== undefined ? options.connector : near_connect_client();
+
+  // the signer. near-kit resolves it from the connected wallet's
+  // first account when signerId is absent, which is what we want.
+  const signer_id = options.signer_id ?? null;
+
+  const wallet = await connector.wallet();
+
+  return await wallet.signAndSendTransaction({
+    ...(signer_id !== null ? { signerId: signer_id } : {}),
+    receiverId: receiver_id,
+    actions: [action],
+  });
+}
+// ========================================
+// ========================================
+
+// ========================================
 // upload one file.
 //
 // the whole flow: encode -> send -> verify.
@@ -496,9 +587,16 @@ export async function verify_transaction(
 // PASSED. we never report success on a receipt status, because the
 // receipt status is false on working uploads too.
 export async function upload_file(file, relative_path, options = {}) {
-  const near = options.near ?? near_kit_client();
   const receiver_id = options.receiver_id ?? FASTDATA_NETWORK.get_receiver_id();
   const signer_id = options.account_id ?? null;
+  // the connector carries the action to the wallet. it is injectable so
+  // a test can drive the real path without a wallet.
+  const connector = options.connector ?? null;
+  // the near instance is only needed for the on-chain verification, so
+  // it is created lazily — a send that fails never needs it, and a test
+  // that only exercises the send never needs a browser.
+  const get_near = () =>
+    options.near !== undefined ? options.near : near_kit_client();
 
   // the path we will serve the file under. computed up front so the
   // failure result can still carry it.
@@ -521,52 +619,70 @@ export async function upload_file(file, relative_path, options = {}) {
 
   // --- send ---
   //
-  // --- THE ARGS GO IN AS A BASE64 STRING. ---
+  // --- THE ARGS GO OUT AS A NATIVE ACTION WITH BASE64 ARGS. ---
   //
-  // this is the subtle part, and it is the opposite of what the
-  // comment above used to say. here is why.
+  // this is the part that took three attempts to get right. here is
+  // the whole story, because the shape matters and the reason is not
+  // obvious.
   //
-  // @hot-labs/near-connect sends the transaction to the wallet as
-  // JSON. in its own source:
+  // near-connect sends the transaction to the wallet as JSON:
   //
-  //   // near-selector.js, the Intear wallet
+  //   // the Intear wallet's near-selector.js
   //   let l = t.map(w => ({ signerId: w.signerId, receiverId: w.receiverId, actions: w.actions }));
   //   let y = JSON.stringify(l);
   //
-  // and the wallet's own B() helper only converts `params.code` to an
-  // array — it does NOT touch `params.args`.
+  // the wallet then parses each action. from the wallet's source
+  // (INTEARnear/wallet, web/src/utils.rs):
   //
-  // so what the wallet ends up holding depends on what we send:
+  //   #[derive(Deserialize)]
+  //   #[serde(untagged)]
+  //   pub enum SendTransactionsAction {
+  //       Native(NearAction),
+  //       WalletSelector(WalletSelectorAction),
+  //   }
   //
-  //   a Uint8Array  -> JSON.stringify makes it {"0":0,"1":9,...}, an
-  //                    OBJECT keyed by byte index. the wallet then
-  //                    shows it as `json-args '{...}'` and has to GUESS
-  //                    that those numbers are bytes.
+  // TWO paths, and the NATIVE one is tried first.
   //
-  //   a base64 string -> JSON.stringify leaves it a plain string.
-  //                    the wallet's cli formatter has a `base64-args`
-  //                    mode for exactly this, decodes it, and puts the
-  //                    BYTES on chain.
+  // the native path (near-min-api's Action):
   //
-  // the base64 string is unambiguous, so that is what we send. we
-  // verified the whole path: near-kit -> the adapter -> near-connect's
-  // JSON.stringify -> the wallet. the wallet ends up holding our
-  // base64, and decoding it gives back our exact bytes.
+  //   pub struct FunctionCallAction {
+  //       pub method_name: String,
+  //       #[serde_as(as = "Base64")]
+  //       pub args: Vec<u8>,
+  //       pub gas: Gas,
+  //       pub deposit: NearToken,
+  //   }
   //
-  // THIS IS WHAT THE REFERENCE DOES TOO. it base64s the borsh bytes
-  // and passes the base64 string to callFunction:
+  //   the args are BASE64 IN JSON, DECODED TO RAW BYTES ON CHAIN.
+  //   that is exactly what we need.
   //
-  //   const ffs64 = encodeFfs(part);
-  //   await callFunction({ contractId, method: "__fastdata_fastfs", args: ffs64, gas: "1" });
+  // the wallet-selector path (what near-kit's adapter produces):
   //
-  // the reference WORKS. the sleet.near upload that failed on chain
-  // was not this bug — that one sent the base64 string through
-  // wallet-selector, whose stringifyJsonOrBytes JSON-WRAPPED it into
-  // `"AAkA..."` with quotes. a different wallet, a different
-  // stringification, a different failure.
+  //   args: serde_json::Value,
+  //   ...
+  //   args: serde_json::to_vec(&args).unwrap_or_default(),
   //
-  // no signerId: near.call resolves the signer itself, so the wallet's
-  // account signs. no deposit: the base action fee is charged anyway.
+  //   the args are a JSON VALUE, SERIALIZED AS JSON. so a base64
+  //   string value becomes "\"ABEAAA...\"" — WITH QUOTES — and those
+  //   66 bytes of ASCII are what lands on chain. borsh::from_slice
+  //   fails on that, the indexer drops the action, and the file 404s.
+  //   that is exactly what our tx 4s6v2whoeMhkHtwHDBVsp8EqYAVENoVgq4yxbdXJnuDj
+  //   did.
+  //
+  // so we send the NATIVE shape:
+  //
+  //   { "FunctionCall": { "method_name": ..., "args": "<base64>", "gas": ..., "deposit": ... } }
+  //
+  // and the wallet decodes the base64 into our exact bytes, which go on
+  // chain verbatim. the indexer's borsh::from_slice then parses them
+  // and the file lands.
+  //
+  // this is also why the working reference transaction (mob.near ->
+  // fastfs.near) landed 121512 RAW bytes on chain: it went through the
+  // native path.
+  //
+  // no signerId: the wallet's account signs. no deposit: the base
+  // action fee is charged anyway.
   let hash = null;
   let tx_signer_id = null;
   let tx_actions = null;
@@ -583,7 +699,7 @@ export async function upload_file(file, relative_path, options = {}) {
       receiver: receiver_id,
       method: METHOD_NAME,
       gas: GAS,
-      args_type: "base64 string",
+      action_shape: "native FunctionCall (args as base64)",
       args_length: bytes?.length,
       first_byte: bytes?.length ? `0x${bytes[0].toString(16).padStart(2, "0")}` : null,
       // the first bytes as hex, so the borsh header is readable in the
@@ -597,8 +713,10 @@ export async function upload_file(file, relative_path, options = {}) {
         : null,
     });
 
-    const result = await near.call(receiver_id, METHOD_NAME, bytes_to_base64(bytes), {
+    const result = await send_native_function_call(receiver_id, bytes, {
       gas: GAS,
+      ...(connector !== null ? { connector } : {}),
+      ...(signer_id !== null ? { signer_id } : {}),
     });
     hash = result?.transaction?.hash ?? result?.hash ?? null;
     // the transaction itself knows who signed it. this is the
@@ -631,7 +749,7 @@ export async function upload_file(file, relative_path, options = {}) {
   // to the account id the caller gave us.
   const tx_signer = tx_signer_id ?? signer_id;
 
-  const check = await verify_transaction(near, hash, tx_signer, bytes, tx_actions);
+  const check = await verify_transaction(get_near(), hash, tx_signer, bytes, tx_actions);
 
   // the url names the account that actually paid for the file, so it
   // uses the signer we just saw on chain.
@@ -723,6 +841,7 @@ export const FASTDATA_UPLOAD = {
   bytes_equal,
   base64_to_bytes,
   bytes_to_base64,
+  send_native_function_call,
   find_function_call,
   verify_transaction,
   upload_file,

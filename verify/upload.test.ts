@@ -489,29 +489,64 @@ describe("fastfs upload — the on-chain check", () => {
 // looks like from the chain's point of view.
 function make_sending_near(mangle = false) {
   const sent = [];
-  return {
-    sent,
-    async call(receiver_id, method_name, args, options) {
-      sent.push({ receiver_id, method_name, args, options });
+
+  // the connector models the real wallet: it receives the NATIVE action
+  // and decodes the base64 args into raw bytes, exactly like the Intear
+  // wallet does (near-min-api's FunctionCallAction has
+  // `#[serde_as(as = "Base64")] pub args: Vec<u8>`).
+  // the connector holds the wallet. signAndSendTransaction lives on
+  // the WALLET, not the connector, so the fake models that.
+  const connector = {
+    async wallet() {
       return {
-        transaction: {
-          hash: "FAKEHASH",
-          signer_id: "mob.near",
-          receiver_id,
+        async signAndSendTransaction(params: {
+          signerId?: string;
+          receiverId: string;
+          actions: Array<{
+            type: string;
+            FunctionCall: {
+              method_name: string;
+              args: string;
+              gas: string;
+              deposit: string;
+            };
+          }>;
+        }) {
+      const action = params.actions[0].FunctionCall;
+          sent.push({
+            receiver_id: params.receiverId,
+            method_name: action.method_name,
+            args: action.args,
+            gas: action.gas,
+            deposit: action.deposit,
+          });
+          return {
+            transaction: {
+              hash: "FAKEHASH",
+              signer_id: params.signerId ?? "mob.near",
+              receiver_id: params.receiverId,
+            },
+          };
         },
       };
     },
+  };
+
+  return {
+    sent,
+    connector,
     async getTransactionStatus(_hash, _signer_id, _wait_until) {
       const sent_args = sent[sent.length - 1]?.args ?? "";
 
-      // we send a base64 string. the wallet decodes it and the chain
-      // ends up with the BYTES, which the rpc reports base64-encoded.
+      // the wallet decoded the base64 into bytes. those are the on-chain
+      // args, and the rpc reports them base64-encoded.
       const decoded = new Uint8Array(Buffer.from(sent_args, "base64"));
 
-      // the mangled case models the failure we found on chain: the
-      // args went out as a JSON-wrapped base64 STRING instead of the
-      // bytes, so borsh::from_slice fails and the indexer drops the
-      // action. the file 404s and nothing says why.
+      // the mangled case models the failure we found on chain
+      // (4s6v2whoeMhkHtwHDBVsp8EqYAVENoVgq4yxbdXJnuDj): the args went
+      // out as a JSON-wrapped base64 STRING instead of the bytes, so
+      // borsh::from_slice fails and the indexer drops the action. the
+      // file 404s and nothing says why.
       const on_chain = mangle
         ? new TextEncoder().encode(JSON.stringify(to_base64(decoded)))
         : decoded;
@@ -543,10 +578,11 @@ describe("fastfs upload — the whole flow", () => {
   // a base64 string here is the bug that silently kills an upload,
   // and the gas is proven on chain (the working mob.near upload
   // attached exactly 1 gas). see plan.md section 6.
-  test("the call carries the base64 of the bytes, the right method, the right gas and no signerId", async () => {
+  test("the call carries a NATIVE action with the base64 of the bytes", async () => {
     const near = make_sending_near();
     await FASTDATA_UPLOAD.upload_file(make_file("hello"), "/", {
       near,
+      connector: near.connector,
       receiver_id: "fastfs.near",
       account_id: "mob.near",
     });
@@ -556,22 +592,31 @@ describe("fastfs upload — the whole flow", () => {
     expect(call.method_name).toBe("__fastdata_fastfs");
     expect(call.receiver_id).toBe("fastfs.near");
 
-    // --- THE ARGS ARE A BASE64 STRING ---
-    // near-connect sends the transaction to the wallet as JSON, and
-    // JSON.stringify turns a Uint8Array into {"0":0,"1":9,...}. the
-    // wallet would then have to guess those numbers are bytes. a
-    // base64 string survives JSON.stringify unchanged, and the wallet's
-    // `base64-args` mode decodes it and puts the BYTES on chain.
+    // --- THE ARGS ARE BASE64, IN A NATIVE ACTION ---
     //
-    // this is what the reference implementation does too.
+    // the wallet has two paths (INTEARnear/wallet, web/src/utils.rs):
+    //
+    //   #[serde(untagged)]
+    //   enum SendTransactionsAction { Native(NearAction), WalletSelector(...) }
+    //
+    // the NATIVE one is tried first, and its args are
+    //
+    //   #[serde_as(as = "Base64")] pub args: Vec<u8>
+    //
+    // so the args are base64 in JSON and DECODED TO RAW BYTES ON
+    // CHAIN. that is what we send.
+    //
+    // the wallet-selector path — what near-kit's adapter produces —
+    // takes args as a serde_json::Value and does serde_json::to_vec on
+    // it, so a string comes out QUOTED and the bytes are lost. that is
+    // what our tx 4s6v2whoe... did, and it 404'd.
     expect(typeof call.args).toBe("string");
     const decoded = new Uint8Array(Buffer.from(call.args, "base64"));
     expect(decoded[0]).toBe(0x00);
     expect(decoded.length).toBeGreaterThan(1);
 
-    expect(call.options.gas).toBe("1");
-    // near.call resolves the signer itself, so we must not pass one.
-    expect(call.options.signerId).toBe(undefined);
+    expect(call.gas).toBe("1");
+    expect(call.deposit).toBe("0");
   });
 
   // --- WHY --- the args on chain match ours, so the upload is real.
@@ -580,7 +625,7 @@ describe("fastfs upload — the whole flow", () => {
     const result = await FASTDATA_UPLOAD.upload_file(
       make_file("hello", "text/plain", "small.txt"),
       "/",
-      { near, receiver_id: "fastfs.near", account_id: "mob.near" },
+      { near, connector: near.connector, receiver_id: "fastfs.near", account_id: "mob.near" },
     );
 
     expect(result.status).toBe("success");
@@ -601,7 +646,7 @@ describe("fastfs upload — the whole flow", () => {
     const result = await FASTDATA_UPLOAD.upload_file(
       make_file("hello", "text/plain", "small.txt"),
       "/",
-      { near, receiver_id: "fastfs.near", account_id: "mob.near" },
+      { near, connector: near.connector, receiver_id: "fastfs.near", account_id: "mob.near" },
     );
 
     expect(result.status).toBe("failed");
@@ -614,15 +659,20 @@ describe("fastfs upload — the whole flow", () => {
   // --- WHY --- a transaction that cannot even be sent is a failure,
   // not a success with an empty error.
   test("a failed send is reported as failed", async () => {
-    const near = {
-      async call() {
-        throw new Error("the user rejected the transaction");
+    // the wallet rejects the transaction.
+    const connector = {
+      async wallet() {
+        return {
+          async signAndSendTransaction() {
+            throw new Error("the user rejected the transaction");
+          },
+        };
       },
     };
     const result = await FASTDATA_UPLOAD.upload_file(
       make_file("hello"),
       "/",
-      { near, receiver_id: "fastfs.near", account_id: "mob.near" },
+      { connector, receiver_id: "fastfs.near", account_id: "mob.near" },
     );
 
     expect(result.status).toBe("failed");
@@ -639,7 +689,7 @@ describe("fastfs upload — several files", () => {
     await FASTDATA_UPLOAD.upload_files(
       [make_file("a", "text/plain", "a.txt"), make_file("b", "text/plain", "b.txt")],
       "/",
-      { near, receiver_id: "fastfs.near", account_id: "mob.near" },
+      { near, connector: near.connector, receiver_id: "fastfs.near", account_id: "mob.near" },
     );
 
     expect(near.sent.length).toBe(2);
@@ -650,26 +700,48 @@ describe("fastfs upload — several files", () => {
   // exactly which two and why.
   test("one failing file does not abort the rest", async () => {
     // the middle file is the one that fails: the wallet rejects it.
-    const near = {
-      sent: [],
-      async call(receiver_id, method_name, args, options) {
-        // the args are a base64 string of the borsh bytes. the path is
-        // in there as plain ascii, so decode to find the file name.
-        const decoded = Buffer.from(args, "base64").toString("latin1");
-        if (decoded.includes("b.txt")) {
-          throw new Error("the user rejected the transaction");
-        }
-        this.sent.push({ receiver_id, method_name, args, options });
+    const sent: unknown[] = [];
+    const connector = {
+      async wallet() {
         return {
-          transaction: {
-            hash: "FAKEHASH",
-            signer_id: "mob.near",
-            receiver_id,
+          async signAndSendTransaction(params: {
+            receiverId: string;
+            actions: Array<{
+              FunctionCall: {
+                method_name: string;
+                args: string;
+                gas: string;
+                deposit: string;
+              };
+            }>;
+          }) {
+            const action = params.actions[0].FunctionCall;
+            // the args are a base64 string of the borsh bytes. the path
+            // is in there as plain ascii, so decode to find the file
+            // name.
+            const decoded = Buffer.from(action.args, "base64").toString(
+              "latin1",
+            );
+            if (decoded.includes("b.txt")) {
+              throw new Error("the user rejected the transaction");
+            }
+            sent.push({ receiver_id: params.receiverId, ...action });
+            return {
+              transaction: {
+                hash: "FAKEHASH",
+                signer_id: "mob.near",
+                receiver_id: params.receiverId,
+              },
+            };
           },
         };
       },
+    };
+    const near = {
+      sent,
+      connector,
       async getTransactionStatus(_hash, _signer_id, _wait_until) {
-        const sent_args = this.sent[this.sent.length - 1]?.args ?? "";
+        const sent_args = (sent[sent.length - 1] as { args: string })?.args ?? "";
         const decoded = new Uint8Array(Buffer.from(sent_args, "base64"));
         return {
           transaction: {
@@ -698,7 +770,7 @@ describe("fastfs upload — several files", () => {
         make_file("c", "text/plain", "c.txt"),
       ],
       "/",
-      { near, receiver_id: "fastfs.near", account_id: "mob.near" },
+      { near, connector: near.connector, receiver_id: "fastfs.near", account_id: "mob.near" },
     );
 
     expect(results.length).toBe(3);
@@ -719,7 +791,7 @@ describe("fastfs upload — several files", () => {
         make_file("b", "text/plain", "two.txt"),
       ],
       "/",
-      { near, receiver_id: "fastfs.near", account_id: "mob.near" },
+      { near, connector: near.connector, receiver_id: "fastfs.near", account_id: "mob.near" },
     );
 
     expect(results.map((r) => r.path)).toEqual(["one.txt", "two.txt"]);
